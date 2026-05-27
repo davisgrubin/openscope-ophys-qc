@@ -5,7 +5,6 @@ Quality control pipeline for the [OpenScope Community Predictive Processing](htt
 The pipeline loads processed NWB/Zarr sessions, computes per-ROI and per-plane QC metrics (dF/F distributions, event rates, soma probability, drift), and produces summary figures and CSVs for a single session or a sample of the full dataset.
 
 ---
-
 ## Repository structure
 
 ```
@@ -56,7 +55,18 @@ Open `DataLoader.ipynb`. The notebook is organized into two stages:
 In Stage 1, set `SESSION_SOURCE` to any processed session path from `s3://aind-open-data`. In Stage 2, `sl.discover_sessions()` will automatically find and deduplicate all available sessions.
 ---
 ## Data
+### Data hierarchy
 
+| Level | Description |
+|-------|-------------|
+| Subject | Single animal |
+| Session | One recording day; corresponds to one raw asset |
+| Plane | One of 8 imaging planes per session (4 per area × 2 areas) |
+| ROI | Individual cell or process within a plane |
+
+Each subject is recorded across ~8 sessions. Cell matching links ROIs across sessions to track the same neurons longitudinally.
+
+### Data Location and Naming Conventions
 Data comes from the [Allen Institute for Neural Dynamics open data bucket](https://registry.opendata.aws/aind-open-data/).
 
 Sessions follow the AIND naming convention:
