@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 from scipy.ndimage import gaussian_filter1d
 from scipy.special import log_ndtr
+from scipy.stats import expon, kstest, norm
 
 
 def half_sample_mode(values: np.ndarray) -> float:
@@ -389,6 +390,71 @@ def event_extraction_metrics(
     }
 
 
+def event_exponential_gaussian_fit_metric(
+    event_trace: np.ndarray,
+    *,
+    threshold: float = 0.0,
+    min_events: int = 20,
+) -> dict[str, float]:
+    """
+    Score whether extracted events look exponential and model residuals Gaussian.
+
+    Positive event amplitudes are compared with a fitted exponential
+    distribution. The sorted-event residuals relative to the expected
+    exponential quantiles are then compared with a fitted Gaussian. The combined
+    score is high when both Kolmogorov-Smirnov statistics are low.
+    """
+    values = np.asarray(event_trace, dtype=float)
+    events = values[np.isfinite(values) & (values > threshold)]
+    if events.size < int(min_events):
+        return {
+            "event_exp_gauss_fit_score": np.nan,
+            "event_exponential_scale": np.nan,
+            "event_exponential_ks_stat": np.nan,
+            "event_exponential_ks_pvalue": np.nan,
+            "event_model_residual_gaussian_ks_stat": np.nan,
+            "event_model_residual_gaussian_ks_pvalue": np.nan,
+        }
+
+    events = np.sort(events)
+    scale = float(np.nanmean(events))
+    if not np.isfinite(scale) or scale <= 0:
+        return {
+            "event_exp_gauss_fit_score": np.nan,
+            "event_exponential_scale": np.nan,
+            "event_exponential_ks_stat": np.nan,
+            "event_exponential_ks_pvalue": np.nan,
+            "event_model_residual_gaussian_ks_stat": np.nan,
+            "event_model_residual_gaussian_ks_pvalue": np.nan,
+        }
+
+    exp_ks = kstest(events, "expon", args=(0.0, scale))
+    probabilities = (np.arange(events.size, dtype=float) + 0.5) / events.size
+    expected = expon.ppf(probabilities, loc=0.0, scale=scale)
+    residuals = events - expected
+    residual_sd = float(np.nanstd(residuals))
+    if np.isfinite(residual_sd) and residual_sd > 0:
+        residual_mu = float(np.nanmean(residuals))
+        gauss_ks = kstest(residuals, "norm", args=(residual_mu, residual_sd))
+        gauss_stat = float(gauss_ks.statistic)
+        gauss_pvalue = float(gauss_ks.pvalue)
+    else:
+        gauss_stat = np.nan
+        gauss_pvalue = np.nan
+
+    stats = [float(exp_ks.statistic), gauss_stat]
+    finite_stats = [stat for stat in stats if np.isfinite(stat)]
+    score = 1.0 - float(np.mean(finite_stats)) if finite_stats else np.nan
+    return {
+        "event_exp_gauss_fit_score": score,
+        "event_exponential_scale": scale,
+        "event_exponential_ks_stat": float(exp_ks.statistic),
+        "event_exponential_ks_pvalue": float(exp_ks.pvalue),
+        "event_model_residual_gaussian_ks_stat": gauss_stat,
+        "event_model_residual_gaussian_ks_pvalue": gauss_pvalue,
+    }
+
+
 def calculate_roi_snr_metrics(
     dff: np.ndarray,
     timestamps: np.ndarray | None = None,
@@ -402,6 +468,7 @@ def calculate_roi_snr_metrics(
     kernel_pre_s: float = 0.5,
     kernel_post_s: float = 2.0,
     max_kernel_events: int = 500,
+    min_events_for_distribution_fit: int = 20,
 ) -> pd.DataFrame:
     """Calculate dF/F and optional extracted-event QC metrics for every ROI."""
     matrix = np.asarray(dff, dtype=float)
@@ -455,6 +522,13 @@ def calculate_roi_snr_metrics(
                     kernel_pre_s=kernel_pre_s,
                     kernel_post_s=kernel_post_s,
                     max_kernel_events=max_kernel_events,
+                )
+            )
+            row.update(
+                event_exponential_gaussian_fit_metric(
+                    event_matrix[:, roi_index],
+                    threshold=event_threshold,
+                    min_events=min_events_for_distribution_fit,
                 )
             )
         rows.append(row)
