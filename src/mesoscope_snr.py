@@ -112,6 +112,98 @@ def robust_event_snr(trace: np.ndarray, sigma: float = 3.0) -> dict[str, float]:
     }
 
 
+def _mad_sd(values: np.ndarray) -> float:
+    """Robust SD estimate from median absolute deviation."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return np.nan
+    center = np.nanmedian(values)
+    mad = np.nanmedian(np.abs(values - center))
+    return float(1.4826 * mad)
+
+
+def signal_noise_component_metrics(
+    trace: np.ndarray,
+    *,
+    sigma: float = 3.0,
+    baseline_bins: int = 10,
+) -> dict[str, float]:
+    """
+    Calculate separable signal and noise estimates plus every signal/noise pair.
+
+    These are intentionally component-style metrics. They let the notebook ask
+    whether a ranking is driven by high signal, low noise, or a particular
+    signal/noise pairing.
+    """
+    values = np.asarray(trace, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return {}
+
+    median = float(np.nanpercentile(values, 50))
+    mode = half_sample_mode(values)
+    lower_deviation = mode - values[values < mode]
+    lower_deviation = lower_deviation[
+        np.isfinite(lower_deviation) & (lower_deviation > 0)
+    ]
+    upper_from_median = values[values > median] - median
+    upper_from_median = upper_from_median[
+        np.isfinite(upper_from_median) & (upper_from_median > 0)
+    ]
+
+    smooth = gaussian_filter1d(values, sigma=float(sigma))
+    residual = values - smooth
+    diff = np.diff(values)
+    bin_medians = np.array(
+        [np.nanmedian(chunk) for chunk in np.array_split(values, max(2, int(baseline_bins)))],
+        dtype=float,
+    )
+    bin_medians = bin_medians[np.isfinite(bin_medians)]
+
+    signal_metrics = {
+        "signal_p95_p50": float(np.nanpercentile(values, 95) - median),
+        "signal_p99_p50": float(np.nanpercentile(values, 99) - median),
+        "signal_p95_mode": float(np.nanpercentile(values, 95) - mode),
+        "signal_upper_mad": _mad_sd(upper_from_median),
+        "signal_positive_auc": float(np.nanmean(np.clip(values - median, 0, None))),
+    }
+    noise_metrics = {
+        "noise_fast_mad": _mad_sd(residual),
+        "noise_firstdiff_mad": _mad_sd(diff) / np.sqrt(2.0) if diff.size else np.nan,
+        "noise_lower_mode_rms": (
+            float(np.sqrt(np.nanmean(lower_deviation**2)))
+            if lower_deviation.size
+            else np.nan
+        ),
+        "noise_lower_mode_mad": (
+            float(2.0 * np.nanmedian(lower_deviation) / 1.349)
+            if lower_deviation.size
+            else np.nan
+        ),
+        "noise_baseline_bin_sd": (
+            float(np.nanstd(bin_medians)) if bin_medians.size else np.nan
+        ),
+    }
+
+    out = {
+        "signal_noise_baseline_median": median,
+        "signal_noise_baseline_mode": float(mode),
+        **signal_metrics,
+        **noise_metrics,
+    }
+    for signal_name, signal_value in signal_metrics.items():
+        for noise_name, noise_value in noise_metrics.items():
+            out[f"snr_pair__{signal_name}__{noise_name}"] = (
+                signal_value / noise_value
+                if np.isfinite(signal_value)
+                and np.isfinite(noise_value)
+                and noise_value > 0
+                else np.nan
+            )
+    return out
+
+
 def roi_mask_metrics(mask: np.ndarray) -> dict[str, float]:
     """Compute area and shape metrics from one dense ROI image mask."""
     binary = np.asarray(mask) > 0
@@ -497,6 +589,13 @@ def calculate_roi_snr_metrics(
         }
         snr_metrics = robust_event_snr(trace, sigma=gaussian_sigma)
         row.update(snr_metrics)
+        row.update(
+            signal_noise_component_metrics(
+                trace,
+                sigma=gaussian_sigma,
+                baseline_bins=baseline_bins,
+            )
+        )
         row.update(
             baseline_stability_metrics(
                 trace,
