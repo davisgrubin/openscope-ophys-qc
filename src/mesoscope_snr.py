@@ -348,6 +348,540 @@ def _event_onsets(event_trace: np.ndarray, threshold: float) -> np.ndarray:
     return np.flatnonzero(positive & ~np.r_[False, positive[:-1]])
 
 
+def _sample_rate_hz_from_timestamps(timestamps: np.ndarray) -> float:
+    """Estimate sample rate from timestamps."""
+    timestamps = np.asarray(timestamps, dtype=float)
+    if len(timestamps) <= 2:
+        return np.nan
+    dt = np.nanmedian(np.diff(timestamps))
+    return float(1.0 / dt) if np.isfinite(dt) and dt > 0 else np.nan
+
+
+def _merged_event_clusters(
+    event_indices: np.ndarray,
+    sample_rate_hz: float,
+    merge_within_s: float,
+) -> list[tuple[int, int, int]]:
+    """Merge event onsets that are close enough to share one calcium transient."""
+    event_indices = np.asarray(event_indices, dtype=int)
+    if event_indices.size == 0:
+        return []
+    merge_frames = max(1, int(round(float(merge_within_s) * sample_rate_hz)))
+    clusters: list[tuple[int, int, int]] = []
+    start = int(event_indices[0])
+    last = int(event_indices[0])
+    count = 1
+    for index in event_indices[1:]:
+        index = int(index)
+        if index - last <= merge_frames:
+            last = index
+            count += 1
+        else:
+            clusters.append((start, last, count))
+            start = last = index
+            count = 1
+    clusters.append((start, last, count))
+    return clusters
+
+
+def background_event_amplitude_metrics(
+    trace: np.ndarray,
+    event_trace: np.ndarray,
+    timestamps: np.ndarray,
+    *,
+    threshold: float = 0.0,
+    background_exclude_pre_s: float = 0.5,
+    background_exclude_post_s: float = 2.0,
+    merge_within_s: float = 0.5,
+    local_baseline_pre_s: float = 0.5,
+    peak_search_post_s: float = 2.0,
+    low_sd: float = 2.0,
+    high_sd: float = 4.0,
+) -> dict[str, float]:
+    """
+    Compare detected calcium events with the ROI's non-event background.
+
+    The background is the dF/F trace after removing windows around detected
+    event onsets. Closely spaced event onsets are merged into a cluster, and
+    the cluster midpoint is used as the event time for amplitude measurement.
+    """
+    values = np.asarray(trace, dtype=float)
+    event_values = np.asarray(event_trace, dtype=float)
+    timestamps = np.asarray(timestamps, dtype=float)
+    if values.shape != event_values.shape:
+        raise ValueError("trace and event_trace must have the same shape")
+
+    sample_rate_hz = _sample_rate_hz_from_timestamps(timestamps)
+    if not np.isfinite(sample_rate_hz) or sample_rate_hz <= 0:
+        return {
+            "background_sample_fraction": np.nan,
+            "background_median_dff": np.nan,
+            "background_noise_sd": np.nan,
+            "background_event_raw_onset_count": np.nan,
+            "background_event_cluster_count": np.nan,
+            "background_event_mean_raw_onsets_per_cluster": np.nan,
+            "background_event_median_amp_dff": np.nan,
+            "background_event_p95_amp_dff": np.nan,
+            "background_event_median_amp_noise_units": np.nan,
+            "background_event_p95_amp_noise_units": np.nan,
+            "background_event_fraction_lt_2sd": np.nan,
+            "background_event_fraction_2_4sd": np.nan,
+            "background_event_fraction_gt_4sd": np.nan,
+            "background_event_count_ge_2sd": np.nan,
+            "background_event_rate_ge_2sd_hz": np.nan,
+            "background_event_max_cluster_span_s": np.nan,
+            "background_event_max_raw_onsets_per_cluster": np.nan,
+        }
+
+    onsets = _event_onsets(event_values, threshold)
+    duration_s = (
+        float(timestamps[-1] - timestamps[0])
+        if len(timestamps) > 1
+        else np.nan
+    )
+    exclude = np.zeros(values.shape[0], dtype=bool)
+    pre_frames = max(0, int(round(background_exclude_pre_s * sample_rate_hz)))
+    post_frames = max(1, int(round(background_exclude_post_s * sample_rate_hz)))
+    for onset in onsets:
+        start = max(0, int(onset) - pre_frames)
+        stop = min(len(values), int(onset) + post_frames + 1)
+        exclude[start:stop] = True
+    background = values[(~exclude) & np.isfinite(values)]
+    background_median = float(np.nanmedian(background)) if background.size else np.nan
+    noise_sd = _mad_sd(background)
+
+    clusters = _merged_event_clusters(onsets, sample_rate_hz, merge_within_s)
+    local_pre_frames = max(1, int(round(local_baseline_pre_s * sample_rate_hz)))
+    peak_post_frames = max(1, int(round(peak_search_post_s * sample_rate_hz)))
+    amplitudes = []
+    cluster_counts = []
+    cluster_spans_s = []
+    for start, last, count in clusters:
+        midpoint = int(round((start + last) / 2.0))
+        baseline_start = max(0, midpoint - local_pre_frames)
+        baseline_window = values[baseline_start:midpoint]
+        local_baseline = (
+            float(np.nanmedian(baseline_window[np.isfinite(baseline_window)]))
+            if np.any(np.isfinite(baseline_window))
+            else background_median
+        )
+        response_stop = min(len(values), midpoint + peak_post_frames + 1)
+        response = values[midpoint:response_stop]
+        if not np.any(np.isfinite(response)) or not np.isfinite(local_baseline):
+            continue
+        amplitudes.append(float(np.nanmax(response) - local_baseline))
+        cluster_counts.append(count)
+        cluster_spans_s.append(float((last - start) / sample_rate_hz))
+
+    amplitudes = np.asarray(amplitudes, dtype=float)
+    valid_noise = np.isfinite(noise_sd) and noise_sd > 0
+    amp_z = amplitudes / noise_sd if valid_noise else np.full(amplitudes.shape, np.nan)
+    valid_z = amp_z[np.isfinite(amp_z)]
+    valid_duration = np.isfinite(duration_s) and duration_s > 0
+    count_ge_low = int(np.sum(valid_z >= low_sd)) if valid_z.size else 0
+
+    return {
+        "background_sample_fraction": float(background.size / values.size) if values.size else np.nan,
+        "background_median_dff": background_median,
+        "background_noise_sd": noise_sd,
+        "background_event_raw_onset_count": int(len(onsets)),
+        "background_event_cluster_count": int(len(clusters)),
+        "background_event_mean_raw_onsets_per_cluster": (
+            float(np.nanmean(cluster_counts)) if cluster_counts else np.nan
+        ),
+        "background_event_median_amp_dff": (
+            float(np.nanmedian(amplitudes)) if amplitudes.size else np.nan
+        ),
+        "background_event_p95_amp_dff": (
+            float(np.nanpercentile(amplitudes, 95)) if amplitudes.size else np.nan
+        ),
+        "background_event_median_amp_noise_units": (
+            float(np.nanmedian(valid_z)) if valid_z.size else np.nan
+        ),
+        "background_event_p95_amp_noise_units": (
+            float(np.nanpercentile(valid_z, 95)) if valid_z.size else np.nan
+        ),
+        "background_event_fraction_lt_2sd": (
+            float(np.mean(valid_z < low_sd)) if valid_z.size else np.nan
+        ),
+        "background_event_fraction_2_4sd": (
+            float(np.mean((valid_z >= low_sd) & (valid_z < high_sd)))
+            if valid_z.size
+            else np.nan
+        ),
+        "background_event_fraction_gt_4sd": (
+            float(np.mean(valid_z >= high_sd)) if valid_z.size else np.nan
+        ),
+        "background_event_count_ge_2sd": count_ge_low,
+        "background_event_rate_ge_2sd_hz": (
+            count_ge_low / duration_s if valid_duration else np.nan
+        ),
+        "background_event_max_cluster_span_s": (
+            float(np.nanmax(cluster_spans_s)) if cluster_spans_s else np.nan
+        ),
+        "background_event_max_raw_onsets_per_cluster": (
+            int(np.nanmax(cluster_counts)) if cluster_counts else 0
+        ),
+    }
+
+
+def event_cluster_amplitude_table(
+    dff: np.ndarray,
+    events: np.ndarray,
+    timestamps: np.ndarray,
+    *,
+    roi_metrics: pd.DataFrame | None = None,
+    plane: str | None = None,
+    event_threshold: float = 0.0,
+    merge_within_s: float = 0.5,
+    local_baseline_pre_s: float = 0.5,
+    peak_search_post_s: float = 2.0,
+    low_sd: float = 2.0,
+    high_sd: float = 4.0,
+    long_span_s: float = 3.0,
+) -> pd.DataFrame:
+    """
+    Return one row per merged event cluster with amplitude and class labels.
+
+    Clusters with first-to-last onset span greater than or equal to
+    ``long_span_s`` are labeled as their own event type and should be excluded
+    from the three-way amplitude composition used for ROI clustering.
+    """
+    matrix = np.asarray(dff, dtype=float)
+    event_matrix = np.asarray(events, dtype=float)
+    timestamps = np.asarray(timestamps, dtype=float)
+    if matrix.ndim != 2:
+        raise ValueError(f"dff must be time-by-ROI, got shape {matrix.shape}")
+    if event_matrix.shape != matrix.shape:
+        raise ValueError(f"events must match dff shape {matrix.shape}, got {event_matrix.shape}")
+    if len(timestamps) != matrix.shape[0]:
+        raise ValueError("timestamps must have one value per dF/F timepoint")
+
+    sample_rate_hz = _sample_rate_hz_from_timestamps(timestamps)
+    if not np.isfinite(sample_rate_hz) or sample_rate_hz <= 0:
+        return pd.DataFrame()
+
+    noise_by_roi: dict[int, float] = {}
+    if roi_metrics is not None and "background_noise_sd" in roi_metrics.columns:
+        for _, row in roi_metrics.iterrows():
+            if pd.isna(row.get("roi_index")):
+                continue
+            noise_by_roi[int(row["roi_index"])] = _jsonable_float(row["background_noise_sd"])
+
+    baseline_pre_frames = max(1, int(round(local_baseline_pre_s * sample_rate_hz)))
+    peak_post_frames = max(1, int(round(peak_search_post_s * sample_rate_hz)))
+    rows = []
+    for roi_index in range(matrix.shape[1]):
+        trace = matrix[:, roi_index]
+        event_trace = event_matrix[:, roi_index]
+        noise_sd = noise_by_roi.get(roi_index)
+        if noise_sd is None or not np.isfinite(noise_sd) or noise_sd <= 0:
+            noise_sd = robust_event_snr(trace)["robust_event_noise_sd"]
+
+        onsets = _event_onsets(event_trace, event_threshold)
+        clusters = _merged_event_clusters(onsets, sample_rate_hz, merge_within_s)
+        for cluster_index, (first, last, raw_count) in enumerate(clusters):
+            midpoint = int(round((first + last) / 2.0))
+            baseline_start = max(0, midpoint - baseline_pre_frames)
+            response_stop = min(matrix.shape[0], midpoint + peak_post_frames + 1)
+            baseline_window = trace[baseline_start:midpoint]
+            response = trace[midpoint:response_stop]
+            local_baseline = (
+                float(np.nanmedian(baseline_window[np.isfinite(baseline_window)]))
+                if np.any(np.isfinite(baseline_window))
+                else np.nan
+            )
+            peak = (
+                float(np.nanmax(response))
+                if np.any(np.isfinite(response))
+                else np.nan
+            )
+            amplitude = peak - local_baseline if np.isfinite(local_baseline) else np.nan
+            amplitude_noise_units = (
+                amplitude / noise_sd
+                if np.isfinite(amplitude) and np.isfinite(noise_sd) and noise_sd > 0
+                else np.nan
+            )
+            cluster_span_s = float((last - first) / sample_rate_hz)
+            if cluster_span_s >= long_span_s:
+                event_type = "long_gt_3s"
+            elif not np.isfinite(amplitude_noise_units):
+                event_type = "missing_amplitude"
+            elif amplitude_noise_units < low_sd:
+                event_type = "lt_2sd"
+            elif amplitude_noise_units < high_sd:
+                event_type = "2_4sd"
+            else:
+                event_type = "gt_4sd"
+
+            row = {
+                "roi_index": int(roi_index),
+                "cluster_index": int(cluster_index),
+                "first_onset_frame": int(first),
+                "last_onset_frame": int(last),
+                "midpoint_frame": int(midpoint),
+                "first_onset_s": float(timestamps[first]),
+                "last_onset_s": float(timestamps[last]),
+                "midpoint_s": float(timestamps[midpoint]),
+                "cluster_span_s": cluster_span_s,
+                "raw_onsets_in_cluster": int(raw_count),
+                "local_baseline_dff": local_baseline,
+                "peak_dff": peak,
+                "event_amplitude_dff": amplitude,
+                "background_noise_sd": float(noise_sd) if np.isfinite(noise_sd) else np.nan,
+                "event_amplitude_noise_units": amplitude_noise_units,
+                "event_type": event_type,
+                "is_long_gt_3s": bool(cluster_span_s >= long_span_s),
+            }
+            if plane is not None:
+                row["plane"] = str(plane)
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _jsonable_float(value) -> float:
+    try:
+        out = float(value)
+    except Exception:
+        return np.nan
+    return out if np.isfinite(out) else np.nan
+
+
+def roi_event_composition_from_cluster_table(
+    cluster_table: pd.DataFrame,
+    *,
+    group_cols: tuple[str, ...] = ("plane", "roi_index"),
+) -> pd.DataFrame:
+    """
+    Calculate ROI event-type fractions, excluding long clusters from 3-way mix.
+
+    The output includes a separate long-cluster fraction across all clusters.
+    The ``nonlong_event_fraction_*`` columns sum to one over non-long clusters
+    only, so long sustained windows do not influence the three-way ROI cluster.
+    """
+    if cluster_table.empty:
+        return pd.DataFrame(columns=[*group_cols])
+    required = set(group_cols).union({"event_type"})
+    missing = sorted(required.difference(cluster_table.columns))
+    if missing:
+        raise KeyError(f"Missing cluster table columns: {missing}")
+
+    type_counts = (
+        cluster_table.groupby([*group_cols, "event_type"], dropna=False)
+        .size()
+        .unstack(fill_value=0)
+        .reset_index()
+    )
+    for col in ["lt_2sd", "2_4sd", "gt_4sd", "long_gt_3s", "missing_amplitude"]:
+        if col not in type_counts.columns:
+            type_counts[col] = 0
+
+    type_counts["n_event_clusters_total"] = (
+        type_counts["lt_2sd"]
+        + type_counts["2_4sd"]
+        + type_counts["gt_4sd"]
+        + type_counts["long_gt_3s"]
+        + type_counts["missing_amplitude"]
+    )
+    type_counts["n_event_clusters_nonlong"] = (
+        type_counts["lt_2sd"] + type_counts["2_4sd"] + type_counts["gt_4sd"]
+    )
+    denom = type_counts["n_event_clusters_nonlong"].replace(0, np.nan)
+    type_counts["nonlong_event_fraction_lt_2sd"] = type_counts["lt_2sd"] / denom
+    type_counts["nonlong_event_fraction_2_4sd"] = type_counts["2_4sd"] / denom
+    type_counts["nonlong_event_fraction_gt_4sd"] = type_counts["gt_4sd"] / denom
+    type_counts["long_gt_3s_fraction_all_clusters"] = (
+        type_counts["long_gt_3s"]
+        / type_counts["n_event_clusters_total"].replace(0, np.nan)
+    )
+    type_counts["has_long_gt_3s_event_cluster"] = type_counts["long_gt_3s"] > 0
+
+    rename_counts = {
+        "lt_2sd": "n_lt_2sd_event_clusters",
+        "2_4sd": "n_2_4sd_event_clusters",
+        "gt_4sd": "n_gt_4sd_event_clusters",
+        "long_gt_3s": "n_long_gt_3s_event_clusters",
+        "missing_amplitude": "n_missing_amplitude_event_clusters",
+    }
+    return type_counts.rename(columns=rename_counts)
+
+
+EVENT_COMPOSITION_COLUMNS = [
+    "background_event_fraction_lt_2sd",
+    "background_event_fraction_2_4sd",
+    "background_event_fraction_gt_4sd",
+]
+
+
+def event_composition_labels(
+    metrics: pd.DataFrame,
+    *,
+    dominance_threshold: float = 0.55,
+    ambiguity_margin: float = 0.15,
+) -> pd.DataFrame:
+    """
+    Label ROIs by which event-amplitude category dominates their events.
+
+    Fractions are expected to represent events below 2 background SD, between
+    2-4 background SD, and above 4 background SD. ROIs are labeled ambiguous
+    when no fraction is dominant enough, or when the top two fractions are too
+    close to interpret as primarily one event type.
+    """
+    missing = [col for col in EVENT_COMPOSITION_COLUMNS if col not in metrics.columns]
+    if missing:
+        raise KeyError(f"Missing event composition columns: {missing}")
+
+    out = metrics.copy()
+    values = out[EVENT_COMPOSITION_COLUMNS].apply(pd.to_numeric, errors="coerce")
+    arr = values.to_numpy(dtype=float)
+    sums = np.nansum(arr, axis=1, keepdims=True)
+    valid = np.isfinite(arr).all(axis=1) & (sums[:, 0] > 0)
+    normalized = np.full_like(arr, np.nan, dtype=float)
+    normalized[valid] = arr[valid] / sums[valid]
+
+    order = np.argsort(np.nan_to_num(normalized, nan=-np.inf), axis=1)
+    top_idx = order[:, -1]
+    second_idx = order[:, -2]
+    top = normalized[np.arange(len(normalized)), top_idx]
+    second = normalized[np.arange(len(normalized)), second_idx]
+    margin = top - second
+    names = np.array(["mostly_sub_2sd", "mostly_2_4sd", "mostly_gt_4sd"], dtype=object)
+    labels = np.full(len(out), "no_events_or_missing", dtype=object)
+    dominant = valid & (top >= dominance_threshold) & (margin >= ambiguity_margin)
+    labels[valid & ~dominant] = "mixed_or_ambiguous"
+    labels[dominant] = names[top_idx[dominant]]
+
+    entropy = np.full(len(out), np.nan, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        entropy[valid] = -np.nansum(
+            normalized[valid] * np.log2(np.clip(normalized[valid], 1e-12, 1.0)),
+            axis=1,
+        ) / np.log2(3)
+
+    out["event_composition_label"] = labels
+    out["event_composition_dominant_fraction"] = top
+    out["event_composition_second_fraction"] = second
+    out["event_composition_margin"] = margin
+    out["event_composition_entropy"] = entropy
+    return out
+
+
+def event_composition_kmeans(
+    metrics: pd.DataFrame,
+    *,
+    n_clusters: int = 3,
+    n_iter: int = 100,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Cluster ROIs by event-amplitude composition using deterministic k-means.
+
+    This intentionally avoids adding a scikit-learn dependency. Initial centers
+    are chosen from quantiles of the high-amplitude event fraction.
+    """
+    missing = [col for col in EVENT_COMPOSITION_COLUMNS if col not in metrics.columns]
+    if missing:
+        raise KeyError(f"Missing event composition columns: {missing}")
+
+    out = metrics.copy()
+    values = out[EVENT_COMPOSITION_COLUMNS].apply(pd.to_numeric, errors="coerce")
+    arr = values.to_numpy(dtype=float)
+    sums = np.nansum(arr, axis=1, keepdims=True)
+    valid = np.isfinite(arr).all(axis=1) & (sums[:, 0] > 0)
+    x = arr[valid] / sums[valid]
+    if x.shape[0] < n_clusters:
+        out["event_composition_cluster"] = np.nan
+        return out, pd.DataFrame()
+
+    order = np.argsort(x[:, 2])
+    quantiles = np.linspace(0, len(order) - 1, n_clusters).round().astype(int)
+    centers = x[order[quantiles]].copy()
+    labels = np.zeros(x.shape[0], dtype=int)
+    for _ in range(max(1, int(n_iter))):
+        distances = np.linalg.norm(x[:, None, :] - centers[None, :, :], axis=2)
+        new_labels = np.argmin(distances, axis=1)
+        new_centers = centers.copy()
+        for cluster in range(n_clusters):
+            members = x[new_labels == cluster]
+            if len(members):
+                new_centers[cluster] = np.mean(members, axis=0)
+        if np.array_equal(new_labels, labels) and np.allclose(new_centers, centers):
+            break
+        labels = new_labels
+        centers = new_centers
+
+    center_order = np.argsort(centers[:, 2])
+    remap = {old: new for new, old in enumerate(center_order)}
+    ordered_labels = np.array([remap[label] for label in labels], dtype=int)
+    ordered_centers = centers[center_order]
+
+    full_labels = np.full(len(out), np.nan)
+    full_labels[valid] = ordered_labels
+    out["event_composition_cluster"] = full_labels
+
+    centroid_rows = []
+    for cluster, center in enumerate(ordered_centers):
+        members = x[ordered_labels == cluster]
+        distances = (
+            np.linalg.norm(members - center[None, :], axis=1)
+            if len(members)
+            else np.array([], dtype=float)
+        )
+        centroid_rows.append(
+            {
+                "event_composition_cluster": cluster,
+                "n_rois": int(len(members)),
+                "centroid_fraction_lt_2sd": float(center[0]),
+                "centroid_fraction_2_4sd": float(center[1]),
+                "centroid_fraction_gt_4sd": float(center[2]),
+                "mean_distance_to_centroid": (
+                    float(np.mean(distances)) if len(distances) else np.nan
+                ),
+            }
+        )
+    return out, pd.DataFrame(centroid_rows)
+
+
+def long_event_window_flags(
+    clusters: pd.DataFrame,
+    *,
+    warning_span_s: float = 3.0,
+    severe_span_s: float = 5.0,
+    extreme_span_s: float = 8.0,
+) -> pd.DataFrame:
+    """Summarize long merged-event clusters per ROI for trace inspection."""
+    required = {"plane", "roi_index", "cluster_span_s", "raw_onsets_in_cluster"}
+    missing = sorted(required.difference(clusters.columns))
+    if missing:
+        raise KeyError(f"Missing cluster columns: {missing}")
+    grouped = clusters.groupby(["plane", "roi_index"], dropna=False)
+    out = grouped.agg(
+        event_cluster_count=("cluster_span_s", "size"),
+        max_event_cluster_span_s=("cluster_span_s", "max"),
+        p95_event_cluster_span_s=("cluster_span_s", lambda x: float(np.nanpercentile(x, 95))),
+        max_raw_onsets_in_cluster=("raw_onsets_in_cluster", "max"),
+    ).reset_index()
+    for threshold, name in [
+        (warning_span_s, "warning"),
+        (severe_span_s, "severe"),
+        (extreme_span_s, "extreme"),
+    ]:
+        counts = (
+            clusters.loc[clusters["cluster_span_s"] >= threshold]
+            .groupby(["plane", "roi_index"], dropna=False)
+            .size()
+            .rename(f"n_{name}_long_event_clusters")
+            .reset_index()
+        )
+        out = out.merge(counts, on=["plane", "roi_index"], how="left")
+        out[f"n_{name}_long_event_clusters"] = (
+            out[f"n_{name}_long_event_clusters"].fillna(0).astype(int)
+        )
+        out[f"has_{name}_long_event_cluster"] = (
+            out[f"n_{name}_long_event_clusters"] > 0
+        )
+    return out
+
+
 def _event_triggered_average(
     trace: np.ndarray,
     event_indices: np.ndarray,
@@ -449,11 +983,7 @@ def event_extraction_metrics(
     )
     positive = event_values[np.isfinite(event_values) & (event_values > threshold)]
     onsets = _event_onsets(event_values, threshold)
-    sample_rate_hz = (
-        float(1.0 / np.nanmedian(np.diff(timestamps)))
-        if len(timestamps) > 2
-        else np.nan
-    )
+    sample_rate_hz = _sample_rate_hz_from_timestamps(timestamps)
     valid_duration = np.isfinite(duration_s) and duration_s > 0
 
     time, transient = (None, None)
@@ -561,6 +1091,11 @@ def calculate_roi_snr_metrics(
     kernel_post_s: float = 2.0,
     max_kernel_events: int = 500,
     min_events_for_distribution_fit: int = 20,
+    background_event_merge_within_s: float = 0.5,
+    background_event_local_baseline_pre_s: float | None = None,
+    background_event_peak_search_post_s: float | None = None,
+    background_event_low_sd: float = 2.0,
+    background_event_high_sd: float = 4.0,
 ) -> pd.DataFrame:
     """Calculate dF/F and optional extracted-event QC metrics for every ROI."""
     matrix = np.asarray(dff, dtype=float)
@@ -621,6 +1156,29 @@ def calculate_roi_snr_metrics(
                     kernel_pre_s=kernel_pre_s,
                     kernel_post_s=kernel_post_s,
                     max_kernel_events=max_kernel_events,
+                )
+            )
+            row.update(
+                background_event_amplitude_metrics(
+                    trace,
+                    event_matrix[:, roi_index],
+                    timestamps,
+                    threshold=event_threshold,
+                    background_exclude_pre_s=kernel_pre_s,
+                    background_exclude_post_s=kernel_post_s,
+                    merge_within_s=background_event_merge_within_s,
+                    local_baseline_pre_s=(
+                        kernel_pre_s
+                        if background_event_local_baseline_pre_s is None
+                        else background_event_local_baseline_pre_s
+                    ),
+                    peak_search_post_s=(
+                        kernel_post_s
+                        if background_event_peak_search_post_s is None
+                        else background_event_peak_search_post_s
+                    ),
+                    low_sd=background_event_low_sd,
+                    high_sd=background_event_high_sd,
                 )
             )
             row.update(

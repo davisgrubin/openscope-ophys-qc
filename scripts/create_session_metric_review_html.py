@@ -151,7 +151,7 @@ HTML_TEMPLATE = r"""<!doctype html>
 <title>__TITLE__</title>
 <style>
 body { margin:0; font-family:Arial, Helvetica, sans-serif; background:#f6f7f8; color:#202124; }
-.page { width:min(1760px, calc(100vw - 28px)); margin:14px auto 28px; }
+.page { width:calc(100vw - 24px); margin:12px auto 28px; }
 .head { display:flex; justify-content:space-between; gap:12px; align-items:end; margin-bottom:10px; }
 h1 { margin:0; font-size:21px; }
 .meta { color:#667085; font-size:13px; text-align:right; }
@@ -160,7 +160,7 @@ label { font-size:12px; color:#475467; display:grid; gap:3px; }
 select, input, button { font:inherit; border:1px solid #d0d5dd; border-radius:6px; padding:7px 8px; background:#fff; box-sizing:border-box; }
 select { width:220px; } #planeSelect { width:120px; } input { width:92px; }
 button { cursor:pointer; white-space:nowrap; }
-.grid { display:grid; grid-template-columns:340px 1fr; gap:10px; }
+.overview { display:grid; grid-template-columns:340px 1fr; gap:10px; }
 .panel { background:#fff; border:1px solid #d0d5dd; border-radius:7px; padding:10px; box-sizing:border-box; }
 .title { font-size:14px; font-weight:700; margin-bottom:8px; }
 .imagewrap { position:relative; width:100%; aspect-ratio:1/1; background:#111; overflow:hidden; }
@@ -174,13 +174,14 @@ button { cursor:pointer; white-space:nowrap; }
 .metricTable th:first-child, .metricTable td:first-child { text-align:left; }
 canvas { width:100%; display:block; background:#fff; border:1px solid #d0d5dd; box-sizing:border-box; }
 #histCanvas { height:210px; }
-#binCanvas { height:500px; }
+#binCanvas { height:760px; cursor:crosshair; }
 #eventCanvas { height:240px; }
 #roiCanvas { height:240px; cursor:grab; }
 .rightGrid { display:grid; grid-template-columns:1fr; gap:10px; }
 .two { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+.tracePanel { margin-top:10px; }
 .note { color:#667085; font-size:12px; margin-top:5px; }
-@media (max-width:1100px) { .grid, .two, .controls { grid-template-columns:1fr; } .head { display:block; } .meta { text-align:left; } }
+@media (max-width:1100px) { .overview, .two, .controls { grid-template-columns:1fr; } .head { display:block; } .meta { text-align:left; } #binCanvas { height:900px; } }
 </style>
 </head>
 <body>
@@ -197,7 +198,7 @@ canvas { width:100%; display:block; background:#fff; border:1px solid #d0d5dd; b
     <label>ROI<input id="roiInput" type="number" min="0" value="0"></label>
     <div><button id="optimize">Optimize high bin by event fit</button> <button id="reset">Reset</button></div>
   </div>
-  <div class="grid">
+  <div class="overview">
     <div>
       <div class="panel"><div class="title">Functional projection</div><div class="imagewrap"><img id="projection"><svg id="overlay" preserveAspectRatio="xMidYMid meet"></svg></div></div>
       <div class="panel" style="margin-top:10px;"><div class="title">Selected ROI metrics</div><div id="roiMetrics"></div></div>
@@ -207,13 +208,13 @@ canvas { width:100%; display:block; background:#fff; border:1px solid #d0d5dd; b
         <div class="panel"><div class="title">Metric distribution and bin boundaries</div><canvas id="histCanvas"></canvas><div class="note" id="binReadout"></div></div>
         <div class="panel"><div class="title">Event-score summary by bin</div><div id="binSummary"></div></div>
       </div>
-      <div class="panel"><div class="title">Low / medium / high ROI dF/F traces</div><canvas id="binCanvas"></canvas><div class="note">Traces are median-centered. Adjust Start/End seconds to zoom into time.</div></div>
       <div class="two">
         <div class="panel"><div class="title">Average event-triggered dF/F by bin</div><canvas id="eventCanvas"></canvas></div>
         <div class="panel"><div class="title">Selected ROI dF/F with detected events</div><canvas id="roiCanvas"></canvas><div class="note">Click ROI masks or change ROI input.</div></div>
       </div>
     </div>
   </div>
+  <div class="panel tracePanel"><div class="title">Stacked low / medium / high ROI dF/F traces</div><canvas id="binCanvas"></canvas><div class="note">Rows are median-centered and robustly scaled per ROI. Mouse wheel zooms around the cursor. Drag across a time window to zoom. Double-click resets to the full loaded trace.</div></div>
 </div>
 <script id="payload" type="application/json">__PAYLOAD__</script>
 <script>
@@ -224,6 +225,7 @@ const binLabels = ["low","medium","high"];
 const binColors = {low:"#4575b4", medium:"#6a994e", high:"#d73027"};
 let plane = payload.planes[0], data = null, metric = payload.metricOptions[0], selected = 0;
 let lowCut = 0, highCut = 1, timeStart = 0, timeEnd = 1;
+let traceDrag = null;
 function b64f32(base64) {
   const binary = atob(base64), bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
@@ -250,6 +252,21 @@ function frameRange() {
   const b = Math.max(a+1, Math.min(data.nFrames, Math.round(timeEnd*data.frameRate)));
   return [a,b];
 }
+function setTimeWindow(start, end) {
+  const dur = duration(), minSpan = Math.max(1 / data.frameRate, 0.05);
+  let a = Math.max(0, Math.min(dur, start)), b = Math.max(0, Math.min(dur, end));
+  if (b < a) [a,b] = [b,a];
+  if ((b-a) < minSpan) {
+    const mid = (a+b) / 2;
+    a = mid - minSpan / 2; b = mid + minSpan / 2;
+  }
+  if (a < 0) { b -= a; a = 0; }
+  if (b > dur) { a -= b-dur; b = dur; }
+  timeStart = Math.max(0, a); timeEnd = Math.min(dur, b);
+  document.getElementById("timeStart").value = timeStart.toFixed(3);
+  document.getElementById("timeEnd").value = timeEnd.toFixed(3);
+}
+function resetTimeWindow() { setTimeWindow(0, Math.min(180, duration())); }
 function traceFor(roi) { return arrays().dff.subarray(roi*data.nFrames, (roi+1)*data.nFrames); }
 function eventsFor(roi) { return arrays().events ? arrays().events.subarray(roi*data.nFrames, (roi+1)*data.nFrames) : null; }
 function assignBin(row) {
@@ -276,9 +293,7 @@ function loadPlane(name) {
   plane = name; data = getPlane(name); metric = document.getElementById("metricSelect").value;
   document.getElementById("projection").src = data.projection;
   document.getElementById("meta").textContent = `${data.nRois} ROIs | ${data.nFrames.toLocaleString()} frames | ${data.frameRate.toFixed(3)} Hz`;
-  document.getElementById("timeEnd").value = Math.min(180, duration()).toFixed(3);
-  document.getElementById("timeStart").value = "0";
-  timeStart = 0; timeEnd = Math.min(180, duration());
+  resetTimeWindow();
   selected = 0; document.getElementById("roiInput").max = data.nRois-1; document.getElementById("roiInput").value = selected;
   makeOverlay(); setDefaultCuts(); redraw();
 }
@@ -333,21 +348,62 @@ function fmt(v) { return Number.isFinite(v) ? v.toPrecision(4) : ""; }
 function drawBinTraces() {
   const [c,ctx]=canvasContext("binCanvas"); clear(ctx,c);
   const bins=currentBins(), [f0,f1]=frameRange(), nShow=Math.max(1, Number(document.getElementById("tracesPerBin").value)||20);
-  const colW=c.width/3, top=28, bottom=28, h=c.height-top-bottom;
-  for (let bi=0; bi<3; bi++) {
-    const b=binLabels[bi], rows=bins[b], xBase=bi*colW, sample=rows.slice().sort((a,b)=>metricValue(a,metric)-metricValue(b,metric)).filter((_,i)=> i % Math.max(1, Math.floor(rows.length/nShow)) === 0).slice(0,nShow);
-    ctx.fillStyle=binColors[b]; ctx.font="13px Arial"; ctx.textAlign="left"; ctx.fillText(`${b} n=${rows.length}`, xBase+8, 18);
-    let all=[]; for (const row of sample) { const tr=traceFor(row.roi_index).subarray(f0,f1); const med=median(Array.from(tr)); for (const y of tr) if (Number.isFinite(y)) all.push(y-med); }
-    const lo = percentile(all,1), hi = percentile(all,99), span=(hi-lo)||1;
-    for (const row of sample) {
-      const tr=traceFor(row.roi_index).subarray(f0,f1), med=median(Array.from(tr));
-      ctx.strokeStyle="rgba(0,0,0,.32)"; ctx.lineWidth=1; ctx.beginPath();
+  const left=92, right=18, top=30, bottom=24, groupGap=22, labelGap=14;
+  const grouped = binLabels.map(b => {
+    const rows = bins[b].slice().sort((a,b)=>metricValue(a,metric)-metricValue(b,metric));
+    const step = Math.max(1, Math.floor(rows.length/nShow));
+    const sample = rows.filter((_,i)=> i % step === 0).slice(0,nShow);
+    return {bin:b, rows, sample};
+  });
+  const nRows = grouped.reduce((acc,g)=>acc+g.sample.length,0);
+  if (!nRows) return;
+  const plotW = c.width-left-right, usableH = c.height-top-bottom-groupGap*2-labelGap*3;
+  const rowH = Math.max(10, usableH / Math.max(1,nRows));
+  let y = top;
+  ctx.font="12px Arial"; ctx.textAlign="left"; ctx.textBaseline="middle";
+  for (const group of grouped) {
+    ctx.fillStyle=binColors[group.bin];
+    ctx.font="13px Arial";
+    ctx.fillText(`${group.bin} bin: ${group.rows.length} ROIs shown ${group.sample.length}`, 8, y);
+    y += labelGap;
+    ctx.strokeStyle="rgba(15,23,42,.18)";
+    ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(left, y-4); ctx.lineTo(c.width-right, y-4); ctx.stroke();
+    for (const row of group.sample) {
+      const tr=traceFor(row.roi_index).subarray(f0,f1);
+      const vals=Array.from(tr).filter(Number.isFinite);
+      const med=median(vals), centered=Array.from(tr).map(v=>v-med);
+      const lo=percentile(centered,1), hi=percentile(centered,99), scale=Math.max(Math.abs(lo), Math.abs(hi), 1e-6);
+      const mid=y+rowH*0.5, amp=rowH*0.38;
+      ctx.strokeStyle="rgba(148,163,184,.45)";
+      ctx.lineWidth=1;
+      ctx.beginPath(); ctx.moveTo(left, mid); ctx.lineTo(c.width-right, mid); ctx.stroke();
+      ctx.fillStyle="#475467"; ctx.font="11px Arial";
+      ctx.fillText(`ROI ${row.roi_index}  ${fmt(metricValue(row,metric))}`, 8, mid);
+      ctx.strokeStyle=group.bin === "low" ? "rgba(69,117,180,.8)" : group.bin === "medium" ? "rgba(106,153,78,.8)" : "rgba(215,48,39,.8)";
+      ctx.lineWidth = row.roi_index === selected ? 2.4 : 1.15;
+      ctx.beginPath();
       for (let i=0;i<tr.length;i++) {
-        const x=xBase+8+i/(tr.length-1)*(colW-16), y=top+h-(tr[i]-med-lo)/span*h;
-        if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+        const x=left+i/Math.max(1,tr.length-1)*plotW;
+        const v=Number.isFinite(centered[i]) ? centered[i] : 0;
+        const yy=mid-Math.max(-1.5, Math.min(1.5, v/scale))*amp;
+        if (i===0) ctx.moveTo(x,yy); else ctx.lineTo(x,yy);
       }
       ctx.stroke();
+      y += rowH;
     }
+    y += groupGap;
+  }
+  ctx.fillStyle="#475467"; ctx.font="12px Arial"; ctx.textAlign="center";
+  ctx.fillText(`${timeStart.toFixed(2)} s`, left, c.height-8);
+  ctx.fillText(`${timeEnd.toFixed(2)} s`, c.width-right, c.height-8);
+  if (traceDrag) {
+    const x0=Math.min(traceDrag.startX, traceDrag.currentX), x1=Math.max(traceDrag.startX, traceDrag.currentX);
+    ctx.fillStyle="rgba(14,165,233,.14)";
+    ctx.fillRect(x0, top, x1-x0, c.height-top-bottom);
+    ctx.strokeStyle="rgba(2,132,199,.85)";
+    ctx.lineWidth=2;
+    ctx.strokeRect(x0, top, x1-x0, c.height-top-bottom);
   }
 }
 function percentile(arr, p) { const v=arr.filter(Number.isFinite).sort((a,b)=>a-b); if(!v.length) return 0; return v[Math.max(0,Math.min(v.length-1,Math.floor((p/100)*(v.length-1))))]; }
@@ -411,12 +467,56 @@ function optimizeHighBin() {
   }
   if (best) { highCut=best.cut; const below=rows.filter(r=>metricValue(r,metric)<highCut).map(r=>metricValue(r,metric)).sort((a,b)=>a-b); lowCut=below[Math.floor(below.length/2)] ?? lowCut; document.getElementById("lowCut").value=Number(lowCut.toPrecision(6)); document.getElementById("highCut").value=Number(highCut.toPrecision(6)); redraw(); }
 }
+function canvasCssX(event, canvas) {
+  const box = canvas.getBoundingClientRect();
+  return Math.max(0, Math.min(box.width, event.clientX - box.left));
+}
+function traceTimeFromCssX(xCss, canvas) {
+  const box = canvas.getBoundingClientRect();
+  const left=92/(window.devicePixelRatio || 1), right=18/(window.devicePixelRatio || 1);
+  const plotLeft = Math.min(box.width-1, left), plotRight = Math.max(plotLeft+1, box.width-right);
+  const frac = Math.max(0, Math.min(1, (xCss-plotLeft)/(plotRight-plotLeft)));
+  return timeStart + frac*(timeEnd-timeStart);
+}
+function setTraceDrag(event, active) {
+  const canvas=document.getElementById("binCanvas"), dpr=window.devicePixelRatio || 1;
+  const x=canvasCssX(event, canvas)*dpr;
+  if (!active) traceDrag = null;
+  else traceDrag = {startX:x, currentX:x};
+}
+const binCanvas = document.getElementById("binCanvas");
+binCanvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  const center = traceTimeFromCssX(canvasCssX(e, binCanvas), binCanvas);
+  const span = timeEnd-timeStart, factor = e.deltaY < 0 ? 0.75 : 1.35;
+  const newSpan = Math.max(0.05, Math.min(duration(), span*factor));
+  const frac = span > 0 ? (center-timeStart)/span : 0.5;
+  setTimeWindow(center-frac*newSpan, center+(1-frac)*newSpan);
+  redraw();
+}, {passive:false});
+binCanvas.addEventListener("mousedown", e => { setTraceDrag(e, true); redraw(); });
+binCanvas.addEventListener("mousemove", e => {
+  if (!traceDrag) return;
+  traceDrag.currentX = canvasCssX(e, binCanvas)*(window.devicePixelRatio || 1);
+  drawBinTraces();
+});
+window.addEventListener("mouseup", e => {
+  if (!traceDrag) return;
+  const startCss = traceDrag.startX/(window.devicePixelRatio || 1);
+  const endCss = canvasCssX(e, binCanvas);
+  const px = Math.abs(endCss-startCss);
+  const t0 = traceTimeFromCssX(startCss, binCanvas), t1 = traceTimeFromCssX(endCss, binCanvas);
+  traceDrag = null;
+  if (px >= 8) setTimeWindow(t0, t1);
+  redraw();
+});
+binCanvas.addEventListener("dblclick", () => { resetTimeWindow(); redraw(); });
 document.getElementById("planeSelect").addEventListener("change", e=>loadPlane(e.target.value));
 document.getElementById("metricSelect").addEventListener("change", e=>{ metric=e.target.value; setDefaultCuts(); redraw(); });
 document.getElementById("lowCut").addEventListener("change", e=>{ lowCut=Number(e.target.value); redraw(); });
 document.getElementById("highCut").addEventListener("change", e=>{ highCut=Number(e.target.value); redraw(); });
-document.getElementById("timeStart").addEventListener("change", e=>{ timeStart=Number(e.target.value); redraw(); });
-document.getElementById("timeEnd").addEventListener("change", e=>{ timeEnd=Number(e.target.value); redraw(); });
+document.getElementById("timeStart").addEventListener("change", e=>{ setTimeWindow(Number(e.target.value), timeEnd); redraw(); });
+document.getElementById("timeEnd").addEventListener("change", e=>{ setTimeWindow(timeStart, Number(e.target.value)); redraw(); });
 document.getElementById("tracesPerBin").addEventListener("change", redraw);
 document.getElementById("roiInput").addEventListener("change", e=>{ selected=Math.max(0,Math.min(data.nRois-1,Math.round(Number(e.target.value)))); redraw(); });
 document.getElementById("optimize").addEventListener("click", optimizeHighBin);
