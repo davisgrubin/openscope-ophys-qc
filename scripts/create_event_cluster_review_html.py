@@ -25,7 +25,6 @@ from create_mesoscope_plane_html import (  # noqa: E402
 
 
 PREFERRED_METRICS = [
-    "background_event_p95_amp_noise_units",
     "background_event_median_amp_noise_units",
     "background_event_fraction_gt_4sd",
     "background_event_fraction_2_4sd",
@@ -187,11 +186,23 @@ def create_event_cluster_review_html(
     metrics = pd.read_csv(metrics_csv)
     if "plane" not in metrics or "roi_index" not in metrics:
         raise ValueError("metrics CSV must include plane and roi_index columns")
+    plane_metadata = _load_plane_metadata(session_dir)
     plane_names = planes or sorted(metrics["plane"].dropna().astype(str).unique())
     plane_names = [plane for plane in plane_names if (session_dir / plane / "dff.npy").exists()]
     if not plane_names:
         raise ValueError(f"No planes with dff.npy found in {session_dir}")
-    plane_metadata = _load_plane_metadata(session_dir)
+    plane_names = sorted(
+        plane_names,
+        key=lambda p: (
+            plane_metadata.get(p, {}).get("structure") or _region_from_plane(p),
+            (
+                plane_metadata.get(p, {}).get("depthUm")
+                if plane_metadata.get(p, {}).get("depthUm") is not None
+                else float("inf")
+            ),
+            p,
+        ),
+    )
 
     payload = {
         "session": session_dir.name,
@@ -273,6 +284,7 @@ canvas { width:100%; display:block; background:#fff; border:1px solid var(--line
 .region-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:10px; }
 .region-canvas { height:416px; cursor:grab; }
 #histCanvas { height:210px; }
+#fitCanvas { height:260px; }
 .long-list { max-height:154px; overflow:auto; border:1px solid var(--line); margin-top:8px; }
 .trace-grid { display:grid; grid-template-columns:1fr; gap:10px; margin-top:10px; }
 .drawer-backdrop { position:fixed; inset:0; background:rgba(15,23,42,.28); opacity:0; pointer-events:none; transition:opacity .16s ease; z-index:20; }
@@ -300,16 +312,16 @@ tr.selected { background:#fff7ed; }
   <div class="controls panel">
     <label>Plane<select id="planeSelect">__PLANE_OPTIONS__</select></label>
     <label>Sort metric<select id="metricSelect">__METRIC_OPTIONS__</select></label>
-    <label>Direction<select id="sortDir"><option value="desc">high first</option><option value="asc">low first</option></select></label>
+    <label>Direction<select id="sortDir"><option value="desc">descending</option><option value="asc">ascending</option></select></label>
     <label>Composition<select id="labelFilter"><option value="all">all</option></select></label>
     <label>Long flags<select id="longFilter"><option value="all">all</option><option value="warning">warning >=3s</option><option value="severe">severe >=5s</option><option value="extreme">extreme >=8s</option></select></label>
-    <div><button id="resetView">Reset</button> <button id="openMetricsDrawer">Rows</button></div>
+    <div><button id="resetView">Reset</button> <button id="openMetricsDrawer">ROI rows</button> <button id="openLongDrawer">Long events</button></div>
   </div>
   <div class="overview-grid">
     <div class="panel"><div class="panel-title">Functional projection</div><div class="image-wrap"><img id="projection"><svg id="overlay" preserveAspectRatio="xMidYMid meet"></svg></div><div class="note" id="roiReadout"></div></div>
     <div class="panel">
       <div class="panel-title">Metric distribution</div><canvas id="histCanvas"></canvas>
-      <div class="panel-title" style="margin-top:10px;">Longest event clusters</div><div class="long-list" id="longList"></div>
+      <div class="panel-title" style="margin-top:10px;">Fit diagnostics for selected ROI and cluster</div><canvas id="fitCanvas"></canvas><div class="note" id="fitReadout"></div>
     </div>
   </div>
   <div class="viewer-grid">
@@ -328,6 +340,10 @@ tr.selected { background:#fff7ed; }
 <aside class="drawer" id="metricsDrawer">
   <div class="drawer-head"><div class="panel-title" style="margin:0;">ROI rows in current sort order</div><button id="closeMetricsDrawer">Close</button></div>
   <div class="table-wrap"><table id="roiTable"></table></div>
+</aside>
+<aside class="drawer" id="longDrawer">
+  <div class="drawer-head"><div class="panel-title" style="margin:0;">Longest event clusters for selected plane</div><button id="closeLongDrawer">Close</button></div>
+  <div class="long-list" id="longList"></div>
 </aside>
 <script id="payload" type="application/json">__PAYLOAD__</script>
 <script>
@@ -400,6 +416,23 @@ function compositionRows() {
     Number.isFinite(metricValue(r,"nonlong_event_fraction_2_4sd")) &&
     Number.isFinite(metricValue(r,"nonlong_event_fraction_gt_4sd"))
   );
+}
+function allMetricRows() {
+  return payload.planes.flatMap(p => (payload.planeData[p].metrics || []));
+}
+function clusterName(cluster) {
+  const rows=allMetricRows().filter(r=>Number(r.nonlong_event_composition_cluster)===Number(cluster));
+  const counts={};
+  for(const row of rows) {
+    const label=String(row.event_composition_label || "").trim();
+    if(label) counts[label]=(counts[label]||0)+1;
+  }
+  const labels=Object.keys(counts).sort((a,b)=>counts[b]-counts[a] || a.localeCompare(b));
+  return labels.length ? labels[0].replaceAll("_"," ") : `cluster ${cluster}`;
+}
+function activeClusterLegend() {
+  const clusters=Array.from(new Set(allMetricRows().map(r=>Number(r.nonlong_event_composition_cluster)).filter(Number.isFinite))).sort((a,b)=>a-b);
+  return clusters.map(cluster=>({cluster:cluster, label:clusterName(cluster)}));
 }
 function rowFor(planeName, roi) {
   const pd=payload.planeData[planeName];
@@ -498,10 +531,13 @@ function drawComposition3d() {
   ctx.fillStyle="#1f2933"; ctx.font="13px Arial"; ctx.textAlign="left"; ctx.textBaseline="top";
   ctx.fillText(`${rows.length} ROIs in current filter`, 12, 14);
   ctx.fillText("Axes: event-size category fractions per ROI", 12, c.height-24);
-  ctx.fillStyle="#4575b4"; ctx.fillText("cluster 0", 12, 36);
-  ctx.fillStyle="#6a994e"; ctx.fillText("cluster 1", 88, 36);
-  ctx.fillStyle="#d73027"; ctx.fillText("cluster 2", 164, 36);
-  ctx.strokeStyle="#111827"; ctx.lineWidth=1.2; ctx.strokeRect(242, 29, 12, 12); ctx.fillStyle="#1f2933"; ctx.fillText("has >=3s event cluster", 260, 36);
+  let lx=12;
+  for(const item of activeClusterLegend()) {
+    ctx.fillStyle=clusterColors[item.cluster] || "#64748b";
+    ctx.fillText(item.label, lx, 36);
+    lx += Math.max(90, item.label.length * 7 + 18);
+  }
+  ctx.strokeStyle="#111827"; ctx.lineWidth=1.2; ctx.strokeRect(lx, 29, 12, 12); ctx.fillStyle="#1f2933"; ctx.fillText("has >=3s event cluster", lx+18, 36);
 }
 function nearestCompositionRoi(event) {
   const c=document.getElementById("compositionCanvas"), box=c.getBoundingClientRect(), dpr=window.devicePixelRatio||1;
@@ -525,18 +561,23 @@ function rotateSpatialPoint(region,x,y,z) {
   return [x1,y1,z2];
 }
 function regionPlanes(region) {
-  return payload.planes.filter(p => (payload.planeData[p].structure || p.replace(/_\d+$/,"")) === region);
+  return payload.planes
+    .filter(p => (payload.planeData[p].structure || p.replace(/_\d+$/,"")) === region)
+    .sort((a,b) => {
+      const da=payload.planeData[a].depthUm, db=payload.planeData[b].depthUm;
+      const af=Number.isFinite(da), bf=Number.isFinite(db);
+      if(af && bf && da !== db) return da-db;
+      if(af !== bf) return af ? -1 : 1;
+      return String(a).localeCompare(String(b));
+    });
 }
 function spatialPoints(region) {
   const out=[], planes=regionPlanes(region);
-  const depths=planes.map(p=>payload.planeData[p].depthUm).filter(Number.isFinite);
-  const minDepth=depths.length ? Math.min(...depths) : 0;
-  const maxDepth=depths.length ? Math.max(...depths) : Math.max(1, planes.length-1);
-  const depthSpan=Math.max(1e-6, maxDepth-minDepth);
+  const denom=Math.max(1, planes.length-1);
   for(let zi=0; zi<planes.length; zi++) {
     const planeName=planes[zi], pd=payload.planeData[planeName];
     if(!pd || !pd.rois) continue;
-    const z=Number.isFinite(pd.depthUm) ? (pd.depthUm-minDepth)/depthSpan : zi/Math.max(1,planes.length-1);
+    const z=zi/denom;
     for(const roi of pd.rois) {
       if(!Number.isFinite(roi.cx) || !Number.isFinite(roi.cy)) continue;
       const row=rowFor(planeName, roi.roi);
@@ -549,6 +590,7 @@ function spatialPoints(region) {
         z:z,
         depthUm:pd.depthUm,
         depthSource:pd.depthSource,
+        depthRank:zi,
         planeIndex:zi,
       });
     }
@@ -574,7 +616,7 @@ function drawSpatial3d(region) {
   const pts=spatialPoints(region), size=4;
   drawSpatialAxis(ctx,c,region,[0,0,0],[1,0,0],"image x");
   drawSpatialAxis(ctx,c,region,[0,0,0],[0,1,0],"image y");
-  drawSpatialAxis(ctx,c,region,[0,0,0],[0,0,1],"depth um");
+  drawSpatialAxis(ctx,c,region,[0,0,0],[0,0,1],"depth order");
   const projected=pts.map(p=>({point:p,...projectSpatialPoint(region,p,c)})).sort((a,b)=>a.z-b.z);
   for(const item of projected) {
     const p=item.point, row=p.row || {}, isCurrentPlane=p.plane===plane, isSel=isCurrentPlane && p.roi===selected;
@@ -589,10 +631,19 @@ function drawSpatial3d(region) {
   ctx.fillStyle="#1f2933"; ctx.font="13px Arial"; ctx.textAlign="left"; ctx.textBaseline="top";
   const planes=regionPlanes(region);
   const depths=planes.map(p=>payload.planeData[p].depthUm).filter(Number.isFinite);
-  const depthLabel=depths.length ? `${Math.min(...depths).toFixed(0)}-${Math.max(...depths).toFixed(0)} um` : "relative plane order";
+  const depthLabel=planes.map(p=> {
+    const d=payload.planeData[p].depthUm;
+    return `${p}:${Number.isFinite(d) ? d.toFixed(0)+" um" : "order"}`;
+  }).join("  ");
   ctx.fillText(`${region}: ${pts.length} ROIs, ${planes.length} planes`, 12, 14);
-  ctx.fillText(`depth: ${depthLabel}`, 12, 34);
+  ctx.fillText(`official depths: ${depthLabel}`, 12, 34);
   ctx.fillText(`selected: ${plane} ROI ${selected}`, 12, 54);
+  let lx=12;
+  for(const item of activeClusterLegend()) {
+    ctx.fillStyle=clusterColors[item.cluster] || "#64748b";
+    ctx.fillText(item.label, lx, c.height-24);
+    lx += Math.max(90, item.label.length * 7 + 18);
+  }
 }
 function drawSpatialRegions() {
   for(const region of payload.regions) drawSpatial3d(region);
@@ -630,9 +681,109 @@ function drawHist() {
   if(Number.isFinite(sv)) { const x=l+(sv-x0)/(x1-x0)*w; ctx.strokeStyle="#c2410c"; ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(x,t); ctx.lineTo(x,t+h); ctx.stroke(); }
   ctx.strokeStyle="#d0d5dd"; ctx.strokeRect(l,t,w,h);
   ctx.fillStyle="#475467"; ctx.font="12px Arial"; ctx.textAlign="center"; ctx.textBaseline="top"; ctx.fillText(metric,l+w/2,c.height-18);
+  ctx.textBaseline="top";
+  for(let tick=0; tick<=4; tick++) {
+    const value=x0+(tick/4)*(x1-x0), x=l+(tick/4)*w;
+    ctx.strokeStyle="#d0d5dd"; ctx.beginPath(); ctx.moveTo(x,t+h); ctx.lineTo(x,t+h+4); ctx.stroke();
+    ctx.fillStyle="#475467"; ctx.fillText(fmt(value), x, t+h+7);
+  }
   ctx.save(); ctx.translate(14,t+h/2); ctx.rotate(-Math.PI/2); ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.fillText("ROI count",0,0); ctx.restore();
   ctx.textAlign="right"; ctx.textBaseline="middle"; ctx.fillText("0",l-6,t+h);
   ctx.fillText(String(ymax),l-6,t);
+}
+function selectedClusterRows() {
+  const row=selectedRow() || {};
+  const cluster=Number(row.nonlong_event_composition_cluster);
+  if(!Number.isFinite(cluster)) return [];
+  return data.metrics.filter(r=>Number(r.nonlong_event_composition_cluster)===cluster);
+}
+function finiteMetric(rows, col) {
+  return rows.map(r=>metricValue(r,col)).filter(Number.isFinite);
+}
+function mean(values) {
+  return values.length ? values.reduce((a,b)=>a+b,0)/values.length : NaN;
+}
+function normalPdf(x, mu, sd) {
+  return Math.exp(-0.5*((x-mu)/sd)**2)/(sd*Math.sqrt(2*Math.PI));
+}
+function expPdf(x, scale) {
+  return x >= 0 && scale > 0 ? Math.exp(-x/scale)/scale : 0;
+}
+function eventValuesForRoi(roi) {
+  const ev=eventsFor(roi);
+  if(!ev) return [];
+  const vals=[];
+  for(let i=0;i<ev.length;i++) if(Number.isFinite(ev[i]) && ev[i]>0) vals.push(ev[i]);
+  vals.sort((a,b)=>a-b);
+  return vals;
+}
+function expResiduals(events, scale) {
+  const residuals=[], n=events.length;
+  if(!n || !Number.isFinite(scale) || scale<=0) return residuals;
+  for(let i=0;i<n;i++) {
+    const p=(i+0.5)/n;
+    const expected=-scale*Math.log(Math.max(1e-12, 1-p));
+    residuals.push(events[i]-expected);
+  }
+  return residuals;
+}
+function drawDensityPanel(ctx, bounds, values, pdfFn, title, xLabel, fillColor, lineColor) {
+  const [l,t,w,h]=bounds;
+  const finite=values.filter(Number.isFinite);
+  ctx.strokeStyle="#d0d5dd"; ctx.strokeRect(l,t,w,h);
+  ctx.fillStyle="#101828"; ctx.font="12px Arial"; ctx.textAlign="left"; ctx.textBaseline="top"; ctx.fillText(title,l,t-16);
+  if(finite.length < 3) {
+    ctx.fillStyle="#667085"; ctx.fillText("not enough samples", l+8, t+8);
+    return;
+  }
+  let x0=Math.min(...finite), x1=Math.max(...finite);
+  if(x0===x1) { x0-=1; x1+=1; }
+  const pad=(x1-x0)*0.06; x0-=pad; x1+=pad;
+  const bins=36, counts=Array(bins).fill(0), dx=(x1-x0)/bins;
+  for(const v of finite) counts[Math.max(0,Math.min(bins-1,Math.floor((v-x0)/(x1-x0)*bins)))]++;
+  const densities=counts.map(n=>n/(finite.length*dx));
+  let ymax=Math.max(...densities, 1e-12);
+  const curve=[];
+  for(let i=0;i<=160;i++) {
+    const x=x0+(i/160)*(x1-x0), y=pdfFn(x);
+    if(Number.isFinite(y)) { curve.push([x,y]); if(y>ymax) ymax=y; }
+  }
+  const xOf=x=>l+((x-x0)/(x1-x0))*w, yOf=y=>t+h-(y/ymax)*h;
+  ctx.fillStyle=fillColor;
+  densities.forEach((d,i)=>{ const x=l+i*w/bins, bh=(d/ymax)*h; ctx.fillRect(x,t+h-bh,w/bins-1,bh); });
+  ctx.strokeStyle=lineColor; ctx.lineWidth=2; ctx.beginPath();
+  curve.forEach(([x,y],i)=>{ const px=xOf(x), py=yOf(y); if(i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py); });
+  ctx.stroke();
+  ctx.fillStyle="#475467"; ctx.font="11px Arial"; ctx.textAlign="center"; ctx.textBaseline="top";
+  for(let tick=0;tick<=4;tick++) {
+    const x=x0+(tick/4)*(x1-x0), px=xOf(x);
+    ctx.strokeStyle="#d0d5dd"; ctx.beginPath(); ctx.moveTo(px,t+h); ctx.lineTo(px,t+h+4); ctx.stroke();
+    ctx.fillText(fmt(x), px, t+h+6);
+  }
+  ctx.fillText(xLabel, l+w/2, t+h+22);
+  ctx.save(); ctx.translate(l-38,t+h/2); ctx.rotate(-Math.PI/2); ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.fillText("density",0,0); ctx.restore();
+}
+function drawFitDiagnostics() {
+  const c=document.getElementById("fitCanvas"); fit(c); const ctx=c.getContext("2d"); clear(ctx,c);
+  const row=selectedRow() || {}, clusterRows=selectedClusterRows();
+  const ev=eventValuesForRoi(selected);
+  const scale=mean(ev);
+  const residuals=expResiduals(ev, scale);
+  const mu=mean(residuals), sd=Math.sqrt(mean(residuals.map(v=>(v-mu)**2)));
+  const l=62, top=30, gap=42, panelH=Math.max(62, (c.height-78-gap)/2), w=c.width-88;
+  drawDensityPanel(ctx, [l,top,w,panelH], ev, x=>expPdf(x, scale), "Selected ROI event amplitudes vs exponential", "event amplitude", "rgba(29,78,216,.45)", "#dc2626");
+  drawDensityPanel(ctx, [l,top+panelH+gap,w,panelH], residuals, x=>normalPdf(x, mu, sd), "Exponential-quantile residuals vs Gaussian", "residual amplitude", "rgba(100,116,139,.62)", "#dc2626");
+  const itemCols=["event_exponential_ks_stat","event_model_residual_gaussian_ks_stat","event_exp_gauss_fit_score"];
+  const cluster=Number(row.nonlong_event_composition_cluster);
+  const label=row.event_composition_label || "";
+  const clusterText=Number.isFinite(cluster) ? clusterName(cluster) : "no cluster";
+  document.getElementById("fitReadout").innerHTML =
+    `<div class="pill">${plane}</div><div class="pill">ROI ${selected}</div><div class="pill">${clusterText}</div><div class="pill">${label}</div>` +
+    `<div class="pill">event samples: ${ev.length}</div><div class="pill">exp scale: ${fmt(scale)}</div><div class="pill">residual mu/sd: ${fmt(mu)} / ${fmt(sd)}</div>` +
+    itemCols.map(col=>`<div class="pill">${col}: ${fmt(metricValue(row,col))}</div>`).join("") +
+    `<div class="pill">selected-plane cluster n: ${clusterRows.length}</div>` +
+    `<div class="pill">cluster median exp KS: ${fmt(median(finiteMetric(clusterRows,"event_exponential_ks_stat")))}</div>` +
+    `<div class="pill">cluster median Gaussian residual KS: ${fmt(median(finiteMetric(clusterRows,"event_model_residual_gaussian_ks_stat")))}</div>`;
 }
 function drawLongList() {
   const div=document.getElementById("longList"); div.replaceChildren();
@@ -703,11 +854,11 @@ function drawRoiTrace() {
 function drawReadout() {
   const row=selectedRow() || {};
   document.querySelectorAll(".roi").forEach(p=>p.classList.toggle("selected", Number(p.dataset.roi)===selected));
-  const fields=["event_composition_label","background_event_p95_amp_noise_units","background_event_fraction_gt_4sd","event_exp_gauss_fit_score","max_event_cluster_span_s","n_severe_long_event_clusters"];
+  const fields=["event_composition_label","background_event_median_amp_noise_units","background_event_fraction_gt_4sd","event_exp_gauss_fit_score","max_event_cluster_span_s","n_severe_long_event_clusters"];
   const pos=currentSortPosition(), posText=pos.index >= 0 ? `${pos.index+1}/${pos.total}` : "not in current filter";
   document.getElementById("roiReadout").innerHTML=`<div class="pill">ROI ${selected}</div><div class="pill">sort position: ${posText}</div>`+fields.map(f=>`<div class="pill">${f}: ${typeof row[f]==="string" ? row[f] : fmt(metricValue(row,f))}</div>`).join("");
 }
-function drawAll() { drawComposition3d(); drawSpatialRegions(); drawTable(); drawHist(); drawLongList(); drawRoiTrace(); drawReadout(); }
+function drawAll() { drawComposition3d(); drawSpatialRegions(); drawTable(); drawHist(); drawFitDiagnostics(); drawLongList(); drawRoiTrace(); drawReadout(); }
 function installTraceInteractions(canvas) {
   canvas.addEventListener("wheel", e=>{ e.preventDefault(); const rect=canvas.getBoundingClientRect(), frac=Math.max(0,Math.min(1,(e.clientX-rect.left)/rect.width)), center=viewStart+frac*(viewEnd-viewStart), scale=e.deltaY<0?.78:1.28, span=Math.max(.5,Math.min(duration(),(viewEnd-viewStart)*scale)); setView(center-frac*span, center+(1-frac)*span); drawAll(); }, {passive:false});
   canvas.addEventListener("mousedown", e=>{ dragState={x:e.clientX,a:viewStart,b:viewEnd}; canvas.style.cursor="grabbing"; });
@@ -757,9 +908,15 @@ function setDrawer(open) {
   document.getElementById("metricsDrawer").classList.toggle("open", open);
   document.getElementById("metricsBackdrop").classList.toggle("open", open);
 }
+function setLongDrawer(open) {
+  document.getElementById("longDrawer").classList.toggle("open", open);
+  document.getElementById("metricsBackdrop").classList.toggle("open", open);
+}
 document.getElementById("openMetricsDrawer").addEventListener("click",()=>setDrawer(true));
 document.getElementById("closeMetricsDrawer").addEventListener("click",()=>setDrawer(false));
-document.getElementById("metricsBackdrop").addEventListener("click",()=>setDrawer(false));
+document.getElementById("openLongDrawer").addEventListener("click",()=>setLongDrawer(true));
+document.getElementById("closeLongDrawer").addEventListener("click",()=>setLongDrawer(false));
+document.getElementById("metricsBackdrop").addEventListener("click",()=>{ setDrawer(false); setLongDrawer(false); });
 installSpatialRegionCanvases();
 loadPlane(plane);
 </script>
