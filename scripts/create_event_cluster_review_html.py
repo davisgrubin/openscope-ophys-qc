@@ -169,6 +169,29 @@ def _plane_payload(
         if roi < 0 or roi >= n_rois:
             continue
         metric_rows.append({col: _json_safe(row[col]) for col in plane_metrics.columns})
+    if not rois and {"roi_centroid_x", "roi_centroid_y"}.issubset(plane_metrics.columns):
+        for _, row in plane_metrics.iterrows():
+            if pd.isna(row["roi_index"]):
+                continue
+            x = pd.to_numeric(row.get("roi_centroid_x"), errors="coerce")
+            y = pd.to_numeric(row.get("roi_centroid_y"), errors="coerce")
+            if not np.isfinite(x) or not np.isfinite(y):
+                continue
+            area = pd.to_numeric(row.get("roi_area_pixels"), errors="coerce")
+            radius = float(np.sqrt(area / np.pi)) if np.isfinite(area) and area > 0 else 4.0
+            radius = float(np.clip(radius, 2.0, 14.0))
+            rois.append(
+                {
+                    "roi": int(row["roi_index"]),
+                    "path": (
+                        f"M{x - radius:.2f} {y:.2f}"
+                        f"a{radius:.2f} {radius:.2f} 0 1 0 {2 * radius:.2f} 0"
+                        f"a{radius:.2f} {radius:.2f} 0 1 0 {-2 * radius:.2f} 0"
+                    ),
+                    "cx": float(x),
+                    "cy": float(y),
+                }
+            )
 
     return {
         "frameRate": frame_rate,

@@ -25,6 +25,117 @@ from src.mesoscope_snr import (  # noqa: E402
 )
 
 
+def _plane_segmentation_from_nwb(nwb, plane: str):
+    proc = nwb.processing[plane]
+    interfaces = getattr(proc, "data_interfaces", {})
+    seg = interfaces.get("image_segmentation") if hasattr(interfaces, "get") else None
+    if seg is None:
+        try:
+            seg = proc["image_segmentation"]
+        except Exception:
+            return None
+    if hasattr(seg, "plane_segmentations"):
+        plane_segmentations = seg.plane_segmentations
+        if "roi_table" in plane_segmentations:
+            return plane_segmentations["roi_table"]
+        keys = list(plane_segmentations.keys())
+        return plane_segmentations[keys[0]] if keys else None
+    if hasattr(seg, "roi_table"):
+        return seg.roi_table
+    try:
+        return seg["roi_table"]
+    except Exception:
+        return None
+
+
+def _read_roi_column(roi_table, col: str, n: int, default=np.nan) -> np.ndarray:
+    if col not in list(getattr(roi_table, "colnames", [])):
+        return np.full(n, default)
+    try:
+        data = roi_table[col].data
+        return np.asarray(data[:])
+    except Exception:
+        try:
+            return np.asarray(roi_table[col][:])
+        except Exception:
+            return np.full(n, default)
+
+
+def _image_mask_geometry(roi_table, n: int) -> pd.DataFrame:
+    if "image_mask" not in list(getattr(roi_table, "colnames", [])):
+        return pd.DataFrame(
+            {
+                "roi_area_pixels": np.full(n, np.nan),
+                "roi_centroid_x": np.full(n, np.nan),
+                "roi_centroid_y": np.full(n, np.nan),
+            }
+        )
+    masks = roi_table["image_mask"].data
+    areas = np.full(n, np.nan)
+    xs = np.full(n, np.nan)
+    ys = np.full(n, np.nan)
+    for roi_index in range(n):
+        try:
+            mask = np.asarray(masks[roi_index])
+        except Exception:
+            continue
+        valid = mask > 0
+        areas[roi_index] = float(np.count_nonzero(valid))
+        if areas[roi_index] <= 0:
+            continue
+        yy, xx = np.nonzero(valid)
+        weights = mask[yy, xx].astype(float)
+        weight_sum = float(np.sum(weights))
+        if weight_sum > 0:
+            xs[roi_index] = float(np.sum(xx * weights) / weight_sum)
+            ys[roi_index] = float(np.sum(yy * weights) / weight_sum)
+        else:
+            xs[roi_index] = float(np.mean(xx))
+            ys[roi_index] = float(np.mean(yy))
+    return pd.DataFrame(
+        {
+            "roi_area_pixels": areas,
+            "roi_centroid_x": xs,
+            "roi_centroid_y": ys,
+        }
+    )
+
+
+def extract_roi_metadata_from_nwb(nwb_source: Path, planes: list[str]) -> pd.DataFrame:
+    """Extract classifier outputs and mask geometry from the NWB ROI tables."""
+    from pynwb import NWBHDF5IO
+
+    rows = []
+    with NWBHDF5IO(str(nwb_source), "r", load_namespaces=True) as io:
+        nwb = io.read()
+        for plane in planes:
+            roi_table = _plane_segmentation_from_nwb(nwb, plane)
+            if roi_table is None:
+                continue
+            n = len(roi_table)
+            table = pd.DataFrame(
+                {
+                    "plane": plane,
+                    "roi_index": np.arange(n, dtype=int),
+                    "is_soma": _read_roi_column(roi_table, "is_soma", n, default=False).astype(bool),
+                    "is_dendrite": _read_roi_column(roi_table, "is_dendrite", n, default=False).astype(bool),
+                    "soma_probability": _read_roi_column(roi_table, "soma_probability", n),
+                    "dendrite_probability": _read_roi_column(roi_table, "dendrite_probability", n),
+                }
+            )
+            table = pd.concat([table, _image_mask_geometry(roi_table, n)], axis=1)
+            table["roi_classifier_confidence"] = np.nanmax(
+                table[["soma_probability", "dendrite_probability"]].to_numpy(dtype=float),
+                axis=1,
+            )
+            table["roi_classifier_margin"] = (
+                pd.to_numeric(table["soma_probability"], errors="coerce")
+                - pd.to_numeric(table["dendrite_probability"], errors="coerce")
+            ).abs()
+            rows.append(table)
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
 def available_planes(session_dir: Path) -> list[str]:
     return sorted(
         p.name for p in session_dir.iterdir() if p.is_dir() and (p / "dff.npy").exists()
@@ -119,6 +230,24 @@ def attach_plane_context(session_dir: Path, metrics: pd.DataFrame) -> pd.DataFra
     return out
 
 
+def attach_nwb_roi_metadata(metrics: pd.DataFrame, roi_metadata: pd.DataFrame) -> pd.DataFrame:
+    if roi_metadata.empty:
+        return metrics
+    out = metrics.copy()
+    roi_metadata = roi_metadata.copy()
+    roi_metadata["roi_index"] = pd.to_numeric(roi_metadata["roi_index"], errors="coerce").astype("Int64")
+    out["roi_index"] = pd.to_numeric(out["roi_index"], errors="coerce").astype("Int64")
+    out = out.merge(roi_metadata, on=["plane", "roi_index"], how="left", suffixes=("", "_nwb"))
+    for col in list(out.columns):
+        if not col.endswith("_nwb"):
+            continue
+        base = col[: -len("_nwb")]
+        out[base] = out[base].combine_first(out[col]) if base in out else out[col]
+        out = out.drop(columns=[col])
+    out["roi_index"] = out["roi_index"].astype(int)
+    return out
+
+
 def add_trace_threshold_metrics(session_dir: Path, metrics: pd.DataFrame, max_frames: int | None) -> pd.DataFrame:
     needed = "trace_event_fraction_gt_4sd"
     if needed in metrics.columns and pd.to_numeric(metrics[needed], errors="coerce").notna().any():
@@ -181,6 +310,7 @@ def build_figure_metrics(
     *,
     metrics_csv: Path | None = None,
     cluster_csv: Path | None = None,
+    nwb_source: Path | None = None,
     planes: list[str] | None = None,
     max_frames: int | None = None,
 ) -> tuple[Path, Path]:
@@ -197,6 +327,11 @@ def build_figure_metrics(
     metrics = metrics.loc[metrics["plane"].astype(str).isin(planes)].copy()
     metrics = add_trace_threshold_metrics(session_dir, metrics, max_frames=max_frames)
     metrics = attach_plane_context(session_dir, metrics)
+    if nwb_source is not None and nwb_source.exists():
+        roi_metadata = extract_roi_metadata_from_nwb(nwb_source, planes)
+        if not roi_metadata.empty:
+            roi_metadata.to_csv(output_dir / f"{stem}_nwb_roi_metadata.csv", index=False)
+            metrics = attach_nwb_roi_metadata(metrics, roi_metadata)
 
     if cluster_csv and cluster_csv.exists():
         clusters = pd.read_csv(cluster_csv)
@@ -239,6 +374,7 @@ def main() -> int:
     parser.add_argument("--output-dir", default=Path("outputs/background_event_qc"), type=Path)
     parser.add_argument("--metrics-csv", type=Path)
     parser.add_argument("--cluster-csv", type=Path)
+    parser.add_argument("--nwb-source", type=Path)
     parser.add_argument("--plane", action="append", dest="planes")
     parser.add_argument("--max-frames", type=int, default=None)
     args = parser.parse_args()
@@ -248,6 +384,7 @@ def main() -> int:
         args.output_dir,
         metrics_csv=args.metrics_csv,
         cluster_csv=args.cluster_csv,
+        nwb_source=args.nwb_source.expanduser().resolve() if args.nwb_source else None,
         planes=args.planes,
         max_frames=args.max_frames,
     )
