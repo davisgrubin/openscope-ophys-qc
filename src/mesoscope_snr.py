@@ -525,6 +525,143 @@ def background_event_amplitude_metrics(
     }
 
 
+def trace_threshold_event_metrics(
+    trace: np.ndarray,
+    timestamps: np.ndarray,
+    *,
+    baseline_percentile: float = 10.0,
+    noise_percentile: float = 50.0,
+    low_sd: float = 2.0,
+    high_sd: float = 4.0,
+    merge_within_s: float = 0.5,
+) -> dict[str, float]:
+    """
+    Detect dF/F excursions after estimating background from the trace itself.
+
+    This is a background-first complement to ``background_event_amplitude_metrics``.
+    It does not use the Allen event trace to define candidate events. Instead it
+    estimates a low-percentile baseline, estimates robust noise from values near
+    the lower half of the trace, identifies contiguous excursions above
+    ``baseline + low_sd * noise_sd``, and merges close excursions into one
+    trace-defined event.
+    """
+    values = np.asarray(trace, dtype=float)
+    timestamps = np.asarray(timestamps, dtype=float)
+    if values.ndim != 1:
+        raise ValueError("trace must be one-dimensional")
+    if len(timestamps) != len(values):
+        raise ValueError("timestamps must have one value per trace sample")
+
+    finite = values[np.isfinite(values)]
+    sample_rate_hz = _sample_rate_hz_from_timestamps(timestamps)
+    duration_s = (
+        float(timestamps[-1] - timestamps[0])
+        if len(timestamps) > 1
+        else np.nan
+    )
+    if finite.size == 0 or not np.isfinite(sample_rate_hz) or sample_rate_hz <= 0:
+        return {
+            "trace_event_baseline_p10_dff": np.nan,
+            "trace_event_noise_sd": np.nan,
+            "trace_event_cluster_count": np.nan,
+            "trace_event_count_ge_2sd": np.nan,
+            "trace_event_rate_ge_2sd_hz": np.nan,
+            "trace_event_median_amp_noise_units": np.nan,
+            "trace_event_p95_amp_noise_units": np.nan,
+            "trace_event_fraction_lt_2sd": np.nan,
+            "trace_event_fraction_2_4sd": np.nan,
+            "trace_event_fraction_gt_4sd": np.nan,
+            "trace_event_max_cluster_span_s": np.nan,
+        }
+
+    baseline = float(np.nanpercentile(finite, baseline_percentile))
+    noise_cutoff = float(np.nanpercentile(finite, noise_percentile))
+    noise_samples = finite[finite <= noise_cutoff]
+    noise_sd = _mad_sd(noise_samples)
+    if not np.isfinite(noise_sd) or noise_sd <= 0:
+        noise_sd = _mad_sd(finite)
+
+    valid_noise = np.isfinite(noise_sd) and noise_sd > 0
+    if not valid_noise:
+        return {
+            "trace_event_baseline_p10_dff": baseline,
+            "trace_event_noise_sd": noise_sd,
+            "trace_event_cluster_count": 0,
+            "trace_event_count_ge_2sd": 0,
+            "trace_event_rate_ge_2sd_hz": np.nan,
+            "trace_event_median_amp_noise_units": np.nan,
+            "trace_event_p95_amp_noise_units": np.nan,
+            "trace_event_fraction_lt_2sd": np.nan,
+            "trace_event_fraction_2_4sd": np.nan,
+            "trace_event_fraction_gt_4sd": np.nan,
+            "trace_event_max_cluster_span_s": np.nan,
+        }
+
+    threshold = baseline + low_sd * noise_sd
+    above = np.isfinite(values) & (values >= threshold)
+    starts = np.flatnonzero(above & ~np.r_[False, above[:-1]])
+    stops = np.flatnonzero(above & ~np.r_[above[1:], False])
+    merge_frames = max(1, int(round(merge_within_s * sample_rate_hz)))
+    clusters: list[tuple[int, int]] = []
+    if len(starts):
+        current_start = int(starts[0])
+        current_stop = int(stops[0])
+        for start, stop in zip(starts[1:], stops[1:]):
+            start = int(start)
+            stop = int(stop)
+            if start - current_stop <= merge_frames:
+                current_stop = stop
+            else:
+                clusters.append((current_start, current_stop))
+                current_start, current_stop = start, stop
+        clusters.append((current_start, current_stop))
+
+    amplitudes = []
+    spans_s = []
+    for start, stop in clusters:
+        response = values[start : stop + 1]
+        if not np.any(np.isfinite(response)):
+            continue
+        amplitudes.append(float(np.nanmax(response) - baseline))
+        spans_s.append(float((stop - start) / sample_rate_hz))
+
+    amplitudes = np.asarray(amplitudes, dtype=float)
+    amp_z = amplitudes / noise_sd if amplitudes.size else np.array([], dtype=float)
+    valid_z = amp_z[np.isfinite(amp_z)]
+    count_ge_low = int(np.sum(valid_z >= low_sd)) if valid_z.size else 0
+    valid_duration = np.isfinite(duration_s) and duration_s > 0
+
+    return {
+        "trace_event_baseline_p10_dff": baseline,
+        "trace_event_noise_sd": noise_sd,
+        "trace_event_cluster_count": int(len(clusters)),
+        "trace_event_count_ge_2sd": count_ge_low,
+        "trace_event_rate_ge_2sd_hz": (
+            count_ge_low / duration_s if valid_duration else np.nan
+        ),
+        "trace_event_median_amp_noise_units": (
+            float(np.nanmedian(valid_z)) if valid_z.size else np.nan
+        ),
+        "trace_event_p95_amp_noise_units": (
+            float(np.nanpercentile(valid_z, 95)) if valid_z.size else np.nan
+        ),
+        "trace_event_fraction_lt_2sd": (
+            float(np.mean(valid_z < low_sd)) if valid_z.size else np.nan
+        ),
+        "trace_event_fraction_2_4sd": (
+            float(np.mean((valid_z >= low_sd) & (valid_z < high_sd)))
+            if valid_z.size
+            else np.nan
+        ),
+        "trace_event_fraction_gt_4sd": (
+            float(np.mean(valid_z >= high_sd)) if valid_z.size else np.nan
+        ),
+        "trace_event_max_cluster_span_s": (
+            float(np.nanmax(spans_s)) if spans_s else np.nan
+        ),
+    }
+
+
 def event_cluster_amplitude_table(
     dff: np.ndarray,
     events: np.ndarray,
@@ -1136,6 +1273,15 @@ def calculate_roi_snr_metrics(
                 trace,
                 snr_metrics["robust_event_noise_sd"],
                 n_bins=baseline_bins,
+            )
+        )
+        row.update(
+            trace_threshold_event_metrics(
+                trace,
+                timestamps,
+                low_sd=background_event_low_sd,
+                high_sd=background_event_high_sd,
+                merge_within_s=background_event_merge_within_s,
             )
         )
         row.update(

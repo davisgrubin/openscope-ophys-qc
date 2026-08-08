@@ -31,9 +31,19 @@ PREFERRED_METRICS = [
     "background_event_fraction_lt_2sd",
     "background_event_count_ge_2sd",
     "background_event_rate_ge_2sd_hz",
+    "trace_event_median_amp_noise_units",
+    "trace_event_fraction_gt_4sd",
+    "trace_event_fraction_2_4sd",
+    "trace_event_fraction_lt_2sd",
+    "trace_event_count_ge_2sd",
+    "trace_event_rate_ge_2sd_hz",
     "event_exp_gauss_fit_score",
     "event_exponential_ks_stat",
     "event_model_residual_gaussian_ks_stat",
+    "roi_area_pixels",
+    "soma_probability",
+    "dendrite_probability",
+    "roi_classifier_confidence",
     "nonlong_event_fraction_gt_4sd",
     "nonlong_event_fraction_2_4sd",
     "nonlong_event_fraction_lt_2sd",
@@ -106,12 +116,43 @@ def _plane_payload(
     plane_info: dict,
     max_frames: int | None,
 ) -> dict:
-    arrays = _load_plane_arrays(session_dir, plane, max_frames=max_frames)
-    projection = arrays["projection"]
-    shape = tuple(arrays["shape"])
-    rois, _ = _build_roi_payload(arrays["roi_indices"], arrays["pixel_masks"], shape)
-    dff = np.asarray(arrays["dff"], dtype=np.float32)
-    events = None if arrays["events"] is None else np.asarray(arrays["events"], dtype=np.float32)
+    fallback_reason = None
+    try:
+        arrays = _load_plane_arrays(session_dir, plane, max_frames=max_frames)
+        projection = arrays["projection"]
+        shape = tuple(arrays["shape"])
+        rois, _ = _build_roi_payload(arrays["roi_indices"], arrays["pixel_masks"], shape)
+        dff = np.asarray(arrays["dff"], dtype=np.float32)
+        events = None if arrays["events"] is None else np.asarray(arrays["events"], dtype=np.float32)
+        frame_rate = float(arrays["frame_rate"])
+    except FileNotFoundError as exc:
+        fallback_reason = str(exc)
+        plane_dir = session_dir / plane
+        dff_raw = np.load(plane_dir / "dff.npy", mmap_mode="r")
+        events_path = plane_dir / "events.npy"
+        events_raw = np.load(events_path, mmap_mode="r") if events_path.exists() else None
+        if dff_raw.shape[0] >= dff_raw.shape[1]:
+            dff_frames_rois = dff_raw
+        else:
+            dff_frames_rois = dff_raw.T
+        n_frames_raw = dff_frames_rois.shape[0]
+        n_frames = n_frames_raw if max_frames is None else min(int(max_frames), n_frames_raw)
+        dff = np.asarray(dff_frames_rois[:n_frames].T, dtype=np.float32)
+        events = None
+        if events_raw is not None:
+            event_frames_rois = events_raw if events_raw.shape[0] >= events_raw.shape[1] else events_raw.T
+            events = np.asarray(event_frames_rois[:n_frames, : dff.shape[0]].T, dtype=np.float32)
+        ts_path = plane_dir / "dff_timestamps.npy"
+        frame_rate = 1.0
+        if ts_path.exists():
+            timestamps = np.load(ts_path, mmap_mode="r")[:n_frames]
+            diffs = np.diff(np.asarray(timestamps, dtype=np.float64))
+            diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+            if diffs.size:
+                frame_rate = float(1.0 / np.median(diffs))
+        shape = (512, 512)
+        projection = np.zeros(shape, dtype=np.float32)
+        rois = []
     n_rois, n_frames = dff.shape
 
     plane_metrics = metrics.loc[metrics["plane"].astype(str) == str(plane)].copy()
@@ -130,7 +171,7 @@ def _plane_payload(
         metric_rows.append({col: _json_safe(row[col]) for col in plane_metrics.columns})
 
     return {
-        "frameRate": float(arrays["frame_rate"]),
+        "frameRate": frame_rate,
         "nRois": int(n_rois),
         "nFrames": int(n_frames),
         "imageWidth": int(shape[1]),
@@ -144,6 +185,7 @@ def _plane_payload(
         "dff": _float32_b64(dff),
         "events": _float32_b64(events) if events is not None else None,
         "eventsAvailable": events is not None,
+        "fallbackReason": fallback_reason,
     }
 
 
@@ -173,6 +215,35 @@ def _top_long_clusters(clusters_csv: Path | None, max_clusters: int) -> list[dic
     ]
 
 
+def _cluster_payload(clusters_csv: Path | None, max_clusters: int) -> list[dict]:
+    if clusters_csv is None or not clusters_csv.exists() or max_clusters <= 0:
+        return []
+    clusters = pd.read_csv(clusters_csv)
+    required = {"plane", "roi_index", "midpoint_s", "evaluation_start_s", "evaluation_end_s"}
+    if not required.issubset(clusters.columns):
+        return []
+    keep = [
+        "plane",
+        "roi_index",
+        "first_onset_s",
+        "last_onset_s",
+        "midpoint_s",
+        "cluster_span_s",
+        "evaluation_start_s",
+        "evaluation_end_s",
+        "raw_onsets_in_cluster",
+        "event_amplitude_noise_units",
+        "event_type",
+    ]
+    keep = [col for col in keep if col in clusters.columns]
+    sort_cols = [col for col in ["plane", "roi_index", "midpoint_s"] if col in clusters.columns]
+    clusters = clusters.sort_values(sort_cols).head(max_clusters)
+    return [
+        {col: _json_safe(row[col]) for col in keep}
+        for _, row in clusters[keep].iterrows()
+    ]
+
+
 def create_event_cluster_review_html(
     session_dir: Path,
     metrics_csv: Path,
@@ -182,6 +253,7 @@ def create_event_cluster_review_html(
     planes: list[str] | None = None,
     max_frames: int | None = None,
     max_long_clusters: int = 500,
+    max_clusters: int = 200000,
 ) -> Path:
     metrics = pd.read_csv(metrics_csv)
     if "plane" not in metrics or "roi_index" not in metrics:
@@ -216,6 +288,7 @@ def create_event_cluster_review_html(
         ),
         "planeData": {},
         "longClusters": _top_long_clusters(clusters_csv, max_long_clusters),
+        "eventClusters": _cluster_payload(clusters_csv, max_clusters),
         "settings": {
             "mergeWithinS": 0.5,
             "baselinePreS": 0.5,
@@ -660,7 +733,7 @@ function nearestSpatialPoint(event, region, c) {
 }
 function drawTable() {
   const table=document.getElementById("roiTable"), rows=filteredRows().slice(0,220);
-  const cols=["roi_index","event_composition_label","event_composition_cluster",metric,"max_event_cluster_span_s","n_warning_long_event_clusters","n_severe_long_event_clusters"];
+  const cols=["roi_index","event_composition_label","event_composition_cluster",metric,"roi_area_pixels","soma_probability","max_event_cluster_span_s","n_warning_long_event_clusters"];
   table.innerHTML="<thead><tr>"+cols.map(c=>`<th>${c}</th>`).join("")+"</tr></thead><tbody></tbody>";
   const tbody=table.querySelector("tbody");
   for(const row of rows) {
@@ -696,6 +769,9 @@ function selectedClusterRows() {
   const cluster=Number(row.nonlong_event_composition_cluster);
   if(!Number.isFinite(cluster)) return [];
   return data.metrics.filter(r=>Number(r.nonlong_event_composition_cluster)===cluster);
+}
+function clustersForRoi(planeName, roi) {
+  return (payload.eventClusters || []).filter(c=>c.plane===planeName && c.roi_index===roi);
 }
 function finiteMetric(rows, col) {
   return rows.map(r=>metricValue(r,col)).filter(Number.isFinite);
@@ -825,7 +901,20 @@ function drawRoiTrace() {
   }
   ctx.fillText(useMs ? "time from window start (ms)" : "session time (s)", l+w/2, c.height-18);
   ctx.save(); ctx.translate(18,t+h/2); ctx.rotate(-Math.PI/2); ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.fillText("dF/F",0,0); ctx.restore();
-  if(ev) { ctx.strokeStyle="rgba(239,68,68,.45)"; for(let i=f0+1;i<=f1;i++) if(ev[i]>0 && !(ev[i-1]>0)) { const x=xOf(i); ctx.beginPath(); ctx.moveTo(x,t); ctx.lineTo(x,t+h); ctx.stroke(); } }
+  const clusters=clustersForRoi(plane, selected);
+  for(const cl of clusters) {
+    const a=Number(cl.evaluation_start_s), b=Number(cl.evaluation_end_s), mid=Number(cl.midpoint_s);
+    if(!Number.isFinite(a) || !Number.isFinite(b) || b < viewStart || a > viewEnd) continue;
+    const xa=l+((Math.max(a,viewStart)-viewStart)/(viewEnd-viewStart))*w;
+    const xb=l+((Math.min(b,viewEnd)-viewStart)/(viewEnd-viewStart))*w;
+    ctx.fillStyle=String(cl.event_type||"").includes("long") ? "rgba(249,115,22,.20)" : "rgba(251,146,60,.13)";
+    ctx.fillRect(xa,t,Math.max(1,xb-xa),h);
+    if(Number.isFinite(mid) && mid >= viewStart && mid <= viewEnd) {
+      const xm=l+((mid-viewStart)/(viewEnd-viewStart))*w;
+      ctx.strokeStyle="#f97316"; ctx.lineWidth=1.3; ctx.beginPath(); ctx.moveTo(xm,t); ctx.lineTo(xm,t+h); ctx.stroke();
+    }
+  }
+  if(ev) { ctx.strokeStyle="rgba(239,68,68,.45)"; ctx.lineWidth=1; for(let i=f0+1;i<=f1;i++) if(ev[i]>0 && !(ev[i-1]>0)) { const x=xOf(i); ctx.beginPath(); ctx.moveTo(x,t); ctx.lineTo(x,t+h); ctx.stroke(); } }
   ctx.strokeStyle="#1d4ed8"; ctx.lineWidth=1.5; ctx.beginPath();
   const spanFrames=Math.max(2, f1-f0+1), columns=Math.max(1,Math.floor(w)), framesPerPixel=spanFrames/columns;
   if(framesPerPixel <= 1.5) {
@@ -850,11 +939,13 @@ function drawRoiTrace() {
   }
   const pos=currentSortPosition(), posText=pos.index >= 0 ? ` | sorted ${pos.index+1}/${pos.total}` : "";
   ctx.stroke(); ctx.fillStyle="#101828"; ctx.font="12px Arial"; ctx.textAlign="left"; ctx.textBaseline="top"; ctx.fillText(`ROI ${selected}${posText} | ${viewStart.toFixed(1)}-${viewEnd.toFixed(1)}s`, l+4, 6);
+  ctx.fillStyle="#475467"; ctx.textAlign="right";
+  ctx.fillText("red: raw event onset | orange: merged event window/midpoint", l+w-4, 6);
 }
 function drawReadout() {
   const row=selectedRow() || {};
   document.querySelectorAll(".roi").forEach(p=>p.classList.toggle("selected", Number(p.dataset.roi)===selected));
-  const fields=["event_composition_label","background_event_median_amp_noise_units","background_event_fraction_gt_4sd","event_exp_gauss_fit_score","max_event_cluster_span_s","n_severe_long_event_clusters"];
+  const fields=["event_composition_label","background_event_median_amp_noise_units","background_event_fraction_gt_4sd","trace_event_fraction_gt_4sd","roi_area_pixels","soma_probability","event_exp_gauss_fit_score","max_event_cluster_span_s"];
   const pos=currentSortPosition(), posText=pos.index >= 0 ? `${pos.index+1}/${pos.total}` : "not in current filter";
   document.getElementById("roiReadout").innerHTML=`<div class="pill">ROI ${selected}</div><div class="pill">sort position: ${posText}</div>`+fields.map(f=>`<div class="pill">${f}: ${typeof row[f]==="string" ? row[f] : fmt(metricValue(row,f))}</div>`).join("");
 }
@@ -934,6 +1025,7 @@ def main() -> int:
     parser.add_argument("--plane", action="append", dest="planes")
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--max-long-clusters", type=int, default=500)
+    parser.add_argument("--max-clusters", type=int, default=200000)
     args = parser.parse_args()
     out = create_event_cluster_review_html(
         args.session_dir.expanduser().resolve(),
@@ -943,6 +1035,7 @@ def main() -> int:
         planes=args.planes,
         max_frames=args.max_frames,
         max_long_clusters=args.max_long_clusters,
+        max_clusters=args.max_clusters,
     )
     print(out)
     return 0
